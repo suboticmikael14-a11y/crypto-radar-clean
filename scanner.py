@@ -20,6 +20,18 @@ PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "60"))
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
+# V2 — suivi de trajectoire après la première détection pilote.
+PILOT_TTL_MIN = int(os.getenv("PILOT_TTL_MIN", "180"))
+MAX_PILOT_24H = float(os.getenv("MAX_PILOT_24H", "10"))
+CONFIRM_MIN_AGE_SEC = int(os.getenv("CONFIRM_MIN_AGE_SEC", "55"))
+CONFIRM_MIN_PRICE_GAIN = float(os.getenv("CONFIRM_MIN_PRICE_GAIN", "0.30"))
+CONFIRM_MIN_RET1 = float(os.getenv("CONFIRM_MIN_RET1", "0.05"))
+CONFIRM_MIN_RET5 = float(os.getenv("CONFIRM_MIN_RET5", "0.35"))
+CONFIRM_MIN_RET15 = float(os.getenv("CONFIRM_MIN_RET15", "0.10"))
+CONFIRM_MIN_VOL_RATIO = float(os.getenv("CONFIRM_MIN_VOL_RATIO", "12"))
+CONFIRM_VOL_KEEP_RATIO = float(os.getenv("CONFIRM_VOL_KEEP_RATIO", "0.85"))
+CONFIRM_MAX_SPREAD = float(os.getenv("CONFIRM_MAX_SPREAD", "0.20"))
+
 HTTP_TIMEOUT = 15
 HISTORY_MAX_MIN = 35
 
@@ -29,10 +41,11 @@ EXCLUDED_BASES = {
 }
 
 session = requests.Session()
-session.headers.update({"Accept": "application/json", "User-Agent": "crypto-radar-clean/1.0"})
+session.headers.update({"Accept": "application/json", "User-Agent": "crypto-radar-clean/2.0"})
 
 history = defaultdict(lambda: deque(maxlen=HISTORY_MAX_MIN + 10))
 last_alert_at = {}
+pilots = {}
 slack_blocked_until = 0.0
 last_slack_send_at = 0.0
 
@@ -59,6 +72,31 @@ class Signal:
     change_24h: float
     score: int
     level: str
+
+
+@dataclass
+class PilotState:
+    created_at: float
+    last_seen_at: float
+    first_price: float
+    first_score: int
+    first_vol_ratio: float
+    first_ret_1m: float
+    first_ret_5m: float
+    first_ret_15m: float
+    first_change_24h: float
+    sightings: int = 1
+    best_score: int = 0
+    best_vol_ratio: float = 0.0
+    best_price: float = 0.0
+
+
+@dataclass
+class ConfirmedCandidate:
+    signal: Signal
+    pilot: PilotState
+    price_gain: float
+    age_min: float
 
 
 def fnum(v, default=0.0):
@@ -167,8 +205,8 @@ def score_signal(pair: str) -> Optional[Signal]:
         return None
     vol_ratio = current_delta / baseline
 
-    # Pré-mouvement haussier: volume anormal, début de momentum,
-    # mais pas une bougie déjà partie de +8/+15%.
+    # Détection pré-mouvement: volume anormal + début de momentum,
+    # sans accepter une bougie déjà partie de façon extrême à très court terme.
     if vol_ratio < MIN_VOLUME_RATIO:
         return None
     if ret1 < -0.35 or ret5 < -0.75:
@@ -179,41 +217,66 @@ def score_signal(pair: str) -> Optional[Signal]:
     score = 0
 
     # Volume relatif: 35 pts max
-    if vol_ratio >= 20: score += 35
-    elif vol_ratio >= 12: score += 30
-    elif vol_ratio >= 8: score += 24
-    elif vol_ratio >= 6: score += 18
+    if vol_ratio >= 20:
+        score += 35
+    elif vol_ratio >= 12:
+        score += 30
+    elif vol_ratio >= 8:
+        score += 24
+    elif vol_ratio >= 6:
+        score += 18
 
-    # Momentum 5 min: le meilleur signal est une hausse déjà visible mais encore modérée.
-    if 0.35 <= ret5 <= 2.5: score += 25
-    elif 0.10 <= ret5 < 0.35: score += 20
-    elif -0.25 <= ret5 < 0.10: score += 12
-    elif 2.5 < ret5 <= 5.0: score += 10
+    # Momentum 5 min: hausse visible mais encore modérée.
+    if 0.35 <= ret5 <= 2.5:
+        score += 25
+    elif 0.10 <= ret5 < 0.35:
+        score += 20
+    elif -0.25 <= ret5 < 0.10:
+        score += 12
+    elif 2.5 < ret5 <= 5.0:
+        score += 10
 
     # Momentum 1 min
-    if 0.05 <= ret1 <= 1.2: score += 15
-    elif -0.10 <= ret1 < 0.05: score += 8
-    elif 1.2 < ret1 <= 2.0: score += 6
+    if 0.05 <= ret1 <= 1.2:
+        score += 15
+    elif -0.10 <= ret1 < 0.05:
+        score += 8
+    elif 1.2 < ret1 <= 2.0:
+        score += 6
 
     # Spread
-    if spread <= 0.08: score += 15
-    elif spread <= 0.15: score += 12
-    elif spread <= 0.30: score += 7
+    if spread <= 0.08:
+        score += 15
+    elif spread <= 0.15:
+        score += 12
+    elif spread <= 0.30:
+        score += 7
 
     # Liquidité
-    if cur.qv24 >= 5_000_000: score += 10
-    elif cur.qv24 >= 1_000_000: score += 7
-    elif cur.qv24 >= 500_000: score += 4
+    if cur.qv24 >= 5_000_000:
+        score += 10
+    elif cur.qv24 >= 1_000_000:
+        score += 7
+    elif cur.qv24 >= 500_000:
+        score += 4
 
-    level = "CONFIRME" if score >= CONFIRMED_SCORE else "ENTREE PILOTE"
     if score < PILOT_SCORE:
         return None
 
-    # Gate fournit change_percentage sur le ticker; injecté plus bas.
+    # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
+    # Il devient d'abord pilote, puis sa trajectoire est évaluée.
     return Signal(
-        pair=pair, price=cur.price, ret_1m=ret1, ret_5m=ret5, ret_15m=ret15,
-        vol_ratio=vol_ratio, qv24=cur.qv24, spread_pct=spread,
-        change_24h=0.0, score=score, level=level
+        pair=pair,
+        price=cur.price,
+        ret_1m=ret1,
+        ret_5m=ret5,
+        ret_15m=ret15,
+        vol_ratio=vol_ratio,
+        qv24=cur.qv24,
+        spread_pct=spread,
+        change_24h=0.0,
+        score=score,
+        level="ENTREE PILOTE",
     )
 
 
@@ -222,17 +285,146 @@ def can_alert(pair: str, now: float) -> bool:
     return (now - last) >= PAIR_COOLDOWN_MIN * 60
 
 
-def format_alert(s: Signal) -> str:
-    icon = "🟢" if s.level == "ENTREE PILOTE" else "✅"
+def cleanup_expired_pilots(now: float):
+    ttl = PILOT_TTL_MIN * 60
+    expired = [pair for pair, p in pilots.items() if now - p.created_at > ttl]
+    for pair in expired:
+        p = pilots.pop(pair)
+        print(
+            f"PILOTE EXPIRE — {pair} | age={((now - p.created_at) / 60):.0f}m | "
+            f"vues={p.sightings} | best_score={p.best_score}",
+            flush=True,
+        )
+
+
+def open_pilot(sig: Signal, now: float) -> bool:
+    # Notre objectif est le pré-mouvement: on ne démarre pas un suivi
+    # si le token est déjà fortement étendu sur 24 h.
+    if sig.change_24h > MAX_PILOT_24H:
+        print(
+            f"PILOTE REJETE — {sig.pair} déjà étendu | "
+            f"24h={sig.change_24h:+.2f}% > {MAX_PILOT_24H:.2f}%",
+            flush=True,
+        )
+        return False
+
+    pilots[sig.pair] = PilotState(
+        created_at=now,
+        last_seen_at=now,
+        first_price=sig.price,
+        first_score=sig.score,
+        first_vol_ratio=sig.vol_ratio,
+        first_ret_1m=sig.ret_1m,
+        first_ret_5m=sig.ret_5m,
+        first_ret_15m=sig.ret_15m,
+        first_change_24h=sig.change_24h,
+        sightings=1,
+        best_score=sig.score,
+        best_vol_ratio=sig.vol_ratio,
+        best_price=sig.price,
+    )
+    print(
+        f"PILOTE OUVERT — {sig.pair} | score={sig.score} | prix={sig.price:.10g} | "
+        f"vol=x{sig.vol_ratio:.1f} | r1={sig.ret_1m:+.2f}% | "
+        f"r5={sig.ret_5m:+.2f}% | r15={sig.ret_15m:+.2f}% | "
+        f"24h={sig.change_24h:+.2f}% | Slack silencieux",
+        flush=True,
+    )
+    return True
+
+
+def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]:
+    if not can_alert(sig.pair, now):
+        return None
+
+    pilot = pilots.get(sig.pair)
+    if pilot is None:
+        open_pilot(sig, now)
+        return None
+
+    pilot.last_seen_at = now
+    pilot.sightings += 1
+    pilot.best_score = max(pilot.best_score, sig.score)
+    pilot.best_vol_ratio = max(pilot.best_vol_ratio, sig.vol_ratio)
+    pilot.best_price = max(pilot.best_price, sig.price)
+
+    age_sec = now - pilot.created_at
+    age_min = age_sec / 60.0
+    price_gain = pct(sig.price, pilot.first_price)
+
+    score_ok = sig.score >= CONFIRMED_SCORE
+    age_ok = age_sec >= CONFIRM_MIN_AGE_SEC
+    price_ok = price_gain >= CONFIRM_MIN_PRICE_GAIN
+    spread_ok = sig.spread_pct <= CONFIRM_MAX_SPREAD
+    extended_ok = (
+        pilot.first_change_24h <= MAX_PILOT_24H
+        and sig.change_24h <= MAX_PILOT_24H
+    )
+
+    volume_ok = (
+        sig.vol_ratio >= CONFIRM_MIN_VOL_RATIO
+        and (
+            sig.vol_ratio >= pilot.first_vol_ratio * CONFIRM_VOL_KEEP_RATIO
+            or sig.vol_ratio >= 20.0
+        )
+    )
+
+    momentum_floor_ok = (
+        sig.ret_1m >= CONFIRM_MIN_RET1
+        and sig.ret_5m >= CONFIRM_MIN_RET5
+        and sig.ret_15m >= CONFIRM_MIN_RET15
+    )
+    momentum_improved = (
+        sig.ret_5m >= pilot.first_ret_5m + 0.10
+        or sig.ret_15m >= pilot.first_ret_15m + 0.15
+        or sig.score >= pilot.first_score + 5
+    )
+
+    if (
+        score_ok
+        and age_ok
+        and price_ok
+        and spread_ok
+        and extended_ok
+        and volume_ok
+        and momentum_floor_ok
+        and momentum_improved
+        and pilot.sightings >= 2
+    ):
+        sig.level = "CONFIRME"
+        return ConfirmedCandidate(
+            signal=sig,
+            pilot=pilot,
+            price_gain=price_gain,
+            age_min=age_min,
+        )
+
+    print(
+        f"PILOTE SUIVI — {sig.pair} | age={age_min:.0f}m | vues={pilot.sightings} | "
+        f"score={sig.score} | gain={price_gain:+.2f}% | vol=x{sig.vol_ratio:.1f} | "
+        f"r5={sig.ret_5m:+.2f}% | r15={sig.ret_15m:+.2f}% | "
+        f"24h={sig.change_24h:+.2f}%",
+        flush=True,
+    )
+    return None
+
+
+def format_confirmed_alert(c: ConfirmedCandidate) -> str:
+    s = c.signal
+    p = c.pilot
     return (
-        f"{icon} CRYPTO RADAR CLEAN — {s.level}\n"
+        f"✅ CRYPTO RADAR CLEAN — CONFIRME TRAJECTOIRE\n"
         f"{s.pair}\n\n"
         f"Score : {s.score}/100\n"
-        f"Prix : {s.price:.10g}\n"
+        f"Prix pilote : {p.first_price:.10g}\n"
+        f"Prix actuel : {s.price:.10g}\n"
+        f"Progression depuis pilote : {c.price_gain:+.2f}%\n"
+        f"Temps depuis pilote : {c.age_min:.0f} min\n"
+        f"Volume relatif pilote : x{p.first_vol_ratio:.1f}\n"
+        f"Volume relatif actuel : x{s.vol_ratio:.1f}\n"
         f"Variation ~1 min : {s.ret_1m:+.2f}%\n"
         f"Variation ~5 min : {s.ret_5m:+.2f}%\n"
         f"Variation ~15 min : {s.ret_15m:+.2f}%\n"
-        f"Volume relatif : x{s.vol_ratio:.1f}\n"
         f"Volume 24 h : ${s.qv24:,.0f}\n"
         f"Spread : {s.spread_pct:.3f}%\n"
         f"Variation 24 h : {s.change_24h:+.2f}%\n"
@@ -291,6 +483,13 @@ def run():
         f"Slack={'ON' if SLACK_ENABLED and SLACK_WEBHOOK_URL else 'OFF'}",
         flush=True,
     )
+    print(
+        f"VALIDATION V2 ACTIVE — PILOTE->TRAJECTOIRE->CONFIRME | "
+        f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
+        f"gain>={CONFIRM_MIN_PRICE_GAIN:.2f}% | r5>={CONFIRM_MIN_RET5:.2f}% | "
+        f"r15>={CONFIRM_MIN_RET15:.2f}% | 24h<={MAX_PILOT_24H:.2f}%",
+        flush=True,
+    )
 
     while True:
         started = time.time()
@@ -304,32 +503,49 @@ def run():
                 by_pair[pair] = t
                 add_snapshot(t, now)
 
-            signals = []
+            cleanup_expired_pilots(now)
+
+            raw_signals = []
             for pair in list(history.keys()):
                 sig = score_signal(pair)
-                if sig and can_alert(pair, now):
-                    sig.change_24h = fnum(by_pair.get(pair, {}).get("change_percentage"))
-                    signals.append(sig)
+                if not sig:
+                    continue
+                sig.change_24h = fnum(by_pair.get(pair, {}).get("change_percentage"))
+                raw_signals.append(sig)
 
-            signals.sort(key=lambda x: (x.level == "CONFIRME", x.score, x.vol_ratio), reverse=True)
-            selected = signals[:MAX_ALERTS_PER_SCAN]
+            # On traite d'abord les meilleurs signaux du scan.
+            raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
+
+            confirmed = []
+            for sig in raw_signals:
+                candidate = evaluate_trajectory(sig, now)
+                if candidate:
+                    confirmed.append(candidate)
+
+            confirmed.sort(
+                key=lambda c: (
+                    c.signal.score,
+                    c.price_gain,
+                    c.signal.vol_ratio,
+                ),
+                reverse=True,
+            )
+            selected = confirmed[:MAX_ALERTS_PER_SCAN]
 
             sent = 0
-            for sig in selected:
-                message = format_alert(sig)
+            for candidate in selected:
+                message = format_confirmed_alert(candidate)
                 print("\n" + message, flush=True)
                 if send_slack_once(message):
-                    last_alert_at[sig.pair] = time.time()
+                    last_alert_at[candidate.signal.pair] = time.time()
+                    pilots.pop(candidate.signal.pair, None)
                     sent += 1
-                elif not SLACK_ENABLED or not SLACK_WEBHOOK_URL:
-                    # En mode logs seuls, ne pas marquer le cooldown:
-                    # cela permet de voir les candidats à chaque scan de validation.
-                    pass
 
             print(
                 f"Scan terminé | {len(tickers)} tickers | "
-                f"{len(signals)} signal(aux) | {len(selected)} sélectionné(s) | "
-                f"{sent} Slack",
+                f"{len(raw_signals)} pilote(s) actif(s) ce scan | "
+                f"{len(confirmed)} confirmation(s) | {sent} Slack | "
+                f"{len(pilots)} pilote(s) suivi(s)",
                 flush=True,
             )
 
