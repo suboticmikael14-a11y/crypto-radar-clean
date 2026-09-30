@@ -2,6 +2,7 @@
 import os
 import time
 import statistics
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional
@@ -19,6 +20,19 @@ MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
 PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "60"))
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+
+# V3 — une IA arbitre uniquement les trajectoires déjà confirmées par la V2.
+# Slack reste silencieux pour PILOTE / ATTENDRE / IGNORER : seule la décision TRADE notifie.
+AI_ENABLED = os.getenv("AI_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip()
+MAX_AI_REVIEWS_PER_SCAN = int(os.getenv("MAX_AI_REVIEWS_PER_SCAN", "3"))
+AI_WAIT_COOLDOWN_MIN = int(os.getenv("AI_WAIT_COOLDOWN_MIN", "5"))
+AI_IGNORE_COOLDOWN_MIN = int(os.getenv("AI_IGNORE_COOLDOWN_MIN", "20"))
+AI_ERROR_COOLDOWN_MIN = int(os.getenv("AI_ERROR_COOLDOWN_MIN", "3"))
+AI_MAX_SIGNAL_AGE_MIN = int(os.getenv("AI_MAX_SIGNAL_AGE_MIN", "90"))
+AI_MAX_PRICE_GAIN = float(os.getenv("AI_MAX_PRICE_GAIN", "4.0"))
+AI_HTTP_TIMEOUT = int(os.getenv("AI_HTTP_TIMEOUT", "35"))
 
 # V2 — suivi de trajectoire après la première détection pilote.
 PILOT_TTL_MIN = int(os.getenv("PILOT_TTL_MIN", "180"))
@@ -41,13 +55,14 @@ EXCLUDED_BASES = {
 }
 
 session = requests.Session()
-session.headers.update({"Accept": "application/json", "User-Agent": "crypto-radar-clean/2.0"})
+session.headers.update({"Accept": "application/json", "User-Agent": "crypto-radar-clean/3.0"})
 
 history = defaultdict(lambda: deque(maxlen=HISTORY_MAX_MIN + 10))
 last_alert_at = {}
 pilots = {}
 slack_blocked_until = 0.0
 last_slack_send_at = 0.0
+ai_next_review_at = {}
 
 
 @dataclass
@@ -97,6 +112,19 @@ class ConfirmedCandidate:
     pilot: PilotState
     price_gain: float
     age_min: float
+
+
+@dataclass
+class AIReview:
+    pair: str
+    decision: str
+    confidence: int
+    reason: str
+    entry_low: Optional[float] = None
+    entry_high: Optional[float] = None
+    invalidation: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
 
 
 def fnum(v, default=0.0):
@@ -290,6 +318,7 @@ def cleanup_expired_pilots(now: float):
     expired = [pair for pair, p in pilots.items() if now - p.created_at > ttl]
     for pair in expired:
         p = pilots.pop(pair)
+        ai_next_review_at.pop(pair, None)
         print(
             f"PILOTE EXPIRE — {pair} | age={((now - p.created_at) / 60):.0f}m | "
             f"vues={p.sightings} | best_score={p.best_score}",
@@ -432,6 +461,225 @@ def format_confirmed_alert(c: ConfirmedCandidate) -> str:
     )
 
 
+def _response_text(data) -> str:
+    """Extrait le texte d'une réponse brute de l'API Responses."""
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    for item in data.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                return content["text"].strip()
+    return ""
+
+
+def _nullable_float(v):
+    if v is None:
+        return None
+    try:
+        x = float(v)
+        return x if x > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _candidate_payload(c: ConfirmedCandidate):
+    s = c.signal
+    p = c.pilot
+    return {
+        "pair": s.pair,
+        "score": s.score,
+        "price": s.price,
+        "pilot_price": p.first_price,
+        "gain_since_pilot_pct": round(c.price_gain, 4),
+        "age_min": round(c.age_min, 1),
+        "vol_ratio_now": round(s.vol_ratio, 2),
+        "vol_ratio_pilot": round(p.first_vol_ratio, 2),
+        "ret_1m_pct": round(s.ret_1m, 4),
+        "ret_5m_pct": round(s.ret_5m, 4),
+        "ret_15m_pct": round(s.ret_15m, 4),
+        "quote_volume_24h_usd": round(s.qv24, 2),
+        "spread_pct": round(s.spread_pct, 5),
+        "change_24h_pct": round(s.change_24h, 4),
+        "pilot_score": p.first_score,
+        "pilot_ret_5m_pct": round(p.first_ret_5m, 4),
+        "pilot_ret_15m_pct": round(p.first_ret_15m, 4),
+        "sightings": p.sightings,
+    }
+
+
+def ai_review_batch(candidates):
+    """Demande à l'IA de choisir au maximum UN setup TRADE parmi les confirmés V2."""
+    if not AI_ENABLED or not OPENAI_API_KEY or not candidates:
+        return None
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "best_trade_pair": {"type": ["string", "null"]},
+            "reviews": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "pair": {"type": "string"},
+                        "decision": {"type": "string", "enum": ["TRADE", "WAIT", "IGNORE"]},
+                        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "reason": {"type": "string"},
+                        "entry_low": {"type": ["number", "null"]},
+                        "entry_high": {"type": ["number", "null"]},
+                        "invalidation": {"type": ["number", "null"]},
+                        "tp1": {"type": ["number", "null"]},
+                        "tp2": {"type": ["number", "null"]},
+                    },
+                    "required": [
+                        "pair", "decision", "confidence", "reason", "entry_low", "entry_high",
+                        "invalidation", "tp1", "tp2"
+                    ],
+                },
+            },
+        },
+        "required": ["best_trade_pair", "reviews"],
+    }
+
+    system_prompt = (
+        "Tu es la couche finale de filtrage d'un radar crypto haussier très court terme. "
+        "Les candidats ont DEJA passé une validation quantitative de trajectoire. "
+        "Ton rôle n'est pas de forcer un trade: WAIT est le choix par défaut si l'avantage n'est pas net. "
+        "Tu dois choisir au maximum UN TRADE dans le lot, celui qui est le plus propre et exploitable maintenant. "
+        "Sinon best_trade_pair doit être null. "
+        "Utilise UNIQUEMENT les données fournies, sans inventer actualité, carnet d'ordres, support ou catalyseur. "
+        "Favorise: momentum 5/15 min cohérent, volume relatif encore fort, spread faible, liquidité correcte, "
+        "progression depuis pilote positive mais pas déjà trop étendue, et âge raisonnable. "
+        "Déclasse si le volume retombe fortement, si le mouvement paraît déjà consommé, si le spread/liquidité est faible, "
+        "ou si le ratio rendement/risque n'est pas propre. "
+        "Pour TRADE seulement, fournis une zone d'entrée autour du prix actuel, une invalidation sous l'entrée, "
+        "et TP1/TP2 au-dessus. Les niveaux doivent être cohérents avec un trade court terme, pas des objectifs fantaisistes. "
+        "La raison doit être en français, concrète, en une phrase courte."
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": json.dumps(
+                        {
+                            "instruction": "Classe ces candidats. Au maximum un seul TRADE; sinon aucun.",
+                            "candidates": [_candidate_payload(c) for c in candidates],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "crypto_trade_review",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "max_output_tokens": 900,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=AI_HTTP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            body = (r.text or "")[:300].replace("\n", " ")
+            print(f"AI HTTP {r.status_code} — {body}", flush=True)
+            return None
+        raw = _response_text(r.json())
+        if not raw:
+            print("AI ERREUR — réponse vide", flush=True)
+            return None
+        parsed = json.loads(raw)
+    except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+        print(f"AI ERREUR — {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+    known = {c.signal.pair for c in candidates}
+    reviews = []
+    for item in parsed.get("reviews", []) or []:
+        pair = str(item.get("pair", "")).strip()
+        decision = str(item.get("decision", "")).strip().upper()
+        if pair not in known or decision not in {"TRADE", "WAIT", "IGNORE"}:
+            continue
+        reviews.append(AIReview(
+            pair=pair,
+            decision=decision,
+            confidence=max(0, min(100, int(item.get("confidence", 0) or 0))),
+            reason=str(item.get("reason", "")).strip()[:300],
+            entry_low=_nullable_float(item.get("entry_low")),
+            entry_high=_nullable_float(item.get("entry_high")),
+            invalidation=_nullable_float(item.get("invalidation")),
+            tp1=_nullable_float(item.get("tp1")),
+            tp2=_nullable_float(item.get("tp2")),
+        ))
+
+    best = parsed.get("best_trade_pair")
+    if best is not None:
+        best = str(best).strip()
+        if best not in known:
+            best = None
+    return best, reviews
+
+
+def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
+    """Garde-fous déterministes avant toute notification Slack."""
+    if review.decision != "TRADE" or review.confidence < 70:
+        return False
+    vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
+    if any(v is None or v <= 0 for v in vals):
+        return False
+    lo, hi, inv, tp1, tp2 = vals
+    if lo > hi or not (inv < lo <= hi < tp1 < tp2):
+        return False
+    # La zone proposée doit rester proche du marché actuel; sinon l'alerte est déjà périmée.
+    if abs(pct(c.signal.price, (lo + hi) / 2.0)) > 3.0:
+        return False
+    risk = ((lo + hi) / 2.0) - inv
+    reward1 = tp1 - ((lo + hi) / 2.0)
+    if risk <= 0 or reward1 / risk < 1.0:
+        return False
+    if c.age_min > AI_MAX_SIGNAL_AGE_MIN or c.price_gain > AI_MAX_PRICE_GAIN:
+        return False
+    return True
+
+
+def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
+    s = c.signal
+    return (
+        f"🚨🟢 CRYPTO RADAR — TRADE\n"
+        f"{s.pair}\n\n"
+        f"Prix actuel : {s.price:.10g}\n"
+        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
+        f"Invalidation : {review.invalidation:.10g}\n"
+        f"TP1 : {review.tp1:.10g}\n"
+        f"TP2 : {review.tp2:.10g}\n"
+        f"Confiance IA : {review.confidence}/100\n\n"
+        f"Pourquoi : {review.reason}\n\n"
+        f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
+        f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
+        f"spread {s.spread_pct:.3f}%\n"
+        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
+        f"Source marché : Gate.io | Filtre V2 + arbitrage IA V3"
+    )
+
+
 def send_slack_once(message: str) -> bool:
     """Un seul POST. Jamais de boucle de retry qui martèle Slack."""
     global slack_blocked_until, last_slack_send_at
@@ -484,12 +732,14 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V2 ACTIVE — PILOTE->TRAJECTOIRE->CONFIRME | "
+        f"VALIDATION V3 ACTIVE — PILOTE->TRAJECTOIRE->CONFIRME->IA->TRADE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
-        f"gain>={CONFIRM_MIN_PRICE_GAIN:.2f}% | r5>={CONFIRM_MIN_RET5:.2f}% | "
-        f"r15>={CONFIRM_MIN_RET15:.2f}% | 24h<={MAX_PILOT_24H:.2f}%",
+        f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
+        f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
         flush=True,
     )
+    if AI_ENABLED and not OPENAI_API_KEY:
+        print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
     while True:
         started = time.time()
@@ -513,7 +763,6 @@ def run():
                 sig.change_24h = fnum(by_pair.get(pair, {}).get("change_percentage"))
                 raw_signals.append(sig)
 
-            # On traite d'abord les meilleurs signaux du scan.
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
 
             confirmed = []
@@ -523,28 +772,91 @@ def run():
                     confirmed.append(candidate)
 
             confirmed.sort(
-                key=lambda c: (
-                    c.signal.score,
-                    c.price_gain,
-                    c.signal.vol_ratio,
-                ),
+                key=lambda c: (c.signal.score, c.price_gain, c.signal.vol_ratio),
                 reverse=True,
             )
-            selected = confirmed[:MAX_ALERTS_PER_SCAN]
 
+            # V3: aucune confirmation V2 n'arrive directement sur Slack.
+            # On ne sollicite l'IA que pour les candidats encore frais et dont le cooldown IA est écoulé.
+            due = []
+            for c in confirmed:
+                pair = c.signal.pair
+                if c.age_min > AI_MAX_SIGNAL_AGE_MIN:
+                    print(
+                        f"AI IGNORE — {pair} trop ancien | age={c.age_min:.0f}m > {AI_MAX_SIGNAL_AGE_MIN}m",
+                        flush=True,
+                    )
+                    pilots.pop(pair, None)
+                    ai_next_review_at.pop(pair, None)
+                    continue
+                if c.price_gain > AI_MAX_PRICE_GAIN:
+                    print(
+                        f"AI IGNORE — {pair} mouvement déjà trop étendu depuis pilote | "
+                        f"gain={c.price_gain:+.2f}% > {AI_MAX_PRICE_GAIN:.2f}%",
+                        flush=True,
+                    )
+                    pilots.pop(pair, None)
+                    ai_next_review_at.pop(pair, None)
+                    continue
+                if now >= ai_next_review_at.get(pair, 0):
+                    due.append(c)
+
+            due = due[:MAX_AI_REVIEWS_PER_SCAN]
             sent = 0
-            for candidate in selected:
-                message = format_confirmed_alert(candidate)
-                print("\n" + message, flush=True)
-                if send_slack_once(message):
-                    last_alert_at[candidate.signal.pair] = time.time()
-                    pilots.pop(candidate.signal.pair, None)
-                    sent += 1
+            ai_reviews_count = 0
+
+            if due and AI_ENABLED and OPENAI_API_KEY:
+                result = ai_review_batch(due)
+                if result is None:
+                    for c in due:
+                        ai_next_review_at[c.signal.pair] = now + AI_ERROR_COOLDOWN_MIN * 60
+                else:
+                    best_pair, reviews = result
+                    ai_reviews_count = len(reviews)
+                    by_candidate = {c.signal.pair: c for c in due}
+                    by_review = {r.pair: r for r in reviews}
+
+                    for c in due:
+                        r = by_review.get(c.signal.pair)
+                        if not r:
+                            ai_next_review_at[c.signal.pair] = now + AI_ERROR_COOLDOWN_MIN * 60
+                            print(f"AI ERREUR — aucune décision pour {c.signal.pair}", flush=True)
+                            continue
+                        print(
+                            f"AI {r.decision} — {r.pair} | confiance={r.confidence} | {r.reason}",
+                            flush=True,
+                        )
+                        cooldown = AI_WAIT_COOLDOWN_MIN if r.decision == "WAIT" else AI_IGNORE_COOLDOWN_MIN
+                        ai_next_review_at[r.pair] = now + cooldown * 60
+
+                    if best_pair:
+                        review = by_review.get(best_pair)
+                        candidate = by_candidate.get(best_pair)
+                        if review and candidate and validate_trade_review(review, candidate):
+                            message = format_trade_alert(candidate, review)
+                            print("\n" + message, flush=True)
+                            if send_slack_once(message):
+                                last_alert_at[best_pair] = time.time()
+                                pilots.pop(best_pair, None)
+                                ai_next_review_at.pop(best_pair, None)
+                                sent = 1
+                        elif review and candidate:
+                            print(
+                                f"AI TRADE BLOQUE — {best_pair} | garde-fou niveaux/risque/âge non validé",
+                                flush=True,
+                            )
+                            ai_next_review_at[best_pair] = now + AI_WAIT_COOLDOWN_MIN * 60
+            elif due:
+                print(
+                    f"AI OFF — {len(due)} confirmé(s) non notifié(s); Slack reste silencieux",
+                    flush=True,
+                )
 
             print(
                 f"Scan terminé | {len(tickers)} tickers | "
                 f"{len(raw_signals)} pilote(s) actif(s) ce scan | "
-                f"{len(confirmed)} confirmation(s) | {sent} Slack | "
+                f"{len(confirmed)} confirmation(s) V2 | {len(due)} revue(s) IA | "
+                f"{ai_reviews_count} décision(s) IA | {sent} TRADE Slack | "
                 f"{len(pilots)} pilote(s) suivi(s)",
                 flush=True,
             )
