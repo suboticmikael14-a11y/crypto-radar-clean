@@ -408,8 +408,6 @@ def fetch_tickers():
 
 def add_snapshot(ticker, now):
     pair = ticker.get("currency_pair", "")
-    if pair in positions:
-        return None
     if excluded_pair(pair):
         return
 
@@ -443,7 +441,7 @@ def minute_volume_deltas(samples):
     return out
 
 
-def score_signal(pair: str) -> Optional[Signal]:
+def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[Signal]:
     samples = history[pair]
     if len(samples) < 7:
         return None
@@ -461,7 +459,7 @@ def score_signal(pair: str) -> Optional[Signal]:
     # 24h est enrichi depuis le ticker Gate après scoring; pour le scoring lui-même,
     # on le calcule depuis l’historique local quand 24h est disponible, sinon 0.
     s24 = closest_before(samples, 24 * 60 * 60 - 30)
-    change24h = pct(cur.price, s24.price) if s24 else 0.0
+    change24h = pct(cur.price, s24.price) if s24 else (gate_change24h if gate_change24h is not None else 0.0)
 
     spread = 999.0
     if cur.bid > 0 and cur.ask > 0 and cur.ask >= cur.bid:
@@ -1052,10 +1050,10 @@ def run():
 
             raw_signals = []
             for pair in list(history.keys()):
-                sig = score_signal(pair)
+                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
+                sig = score_signal(pair, gate24)
                 if not sig:
                     continue
-                sig.change_24h = fnum(by_pair.get(pair, {}).get("change_percentage"))
                 raw_signals.append(sig)
 
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
@@ -1064,6 +1062,8 @@ def run():
 
             confirmed = []
             for sig in raw_signals:
+                if sig.pair in positions:
+                    continue
                 candidate = evaluate_trajectory(sig, now)
                 if candidate:
                     confirmed.append(candidate)
