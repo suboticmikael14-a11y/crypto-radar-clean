@@ -223,8 +223,10 @@ def refresh_cdc_pairs(now=None):
             continue
         name = str(item.get("symbol") or item.get("instrument_name") or "").upper().strip()
         inst_type = str(item.get("inst_type") or item.get("type") or "").upper()
-        status = str(item.get("status") or "").upper()
-        if name and ("SPOT" in inst_type or not inst_type) and status not in {"SUSPENDED", "DISABLED", "INACTIVE"}:
+        product_type = str(item.get("product_type") or "").upper()
+        tradable = item.get("tradable") is True
+        # Crypto.com labels spot markets as CCY_PAIR, not SPOT. Keep only live digital-currency pairs.
+        if name and inst_type == "CCY_PAIR" and product_type == "DIGITAL_CURRENCIES" and tradable:
             fresh.add(name)
     if not fresh:
         raise RuntimeError("Whitelist Crypto.com Exchange vide")
