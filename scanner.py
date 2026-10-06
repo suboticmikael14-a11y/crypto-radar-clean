@@ -980,8 +980,7 @@ def run():
                         candidate = by_candidate.get(best_pair)
                         if review and candidate and validate_trade_review(review, candidate):
                             message = format_trade_alert(candidate, review)
-                            print("
-" + message, flush=True)
+                            print(message, flush=True)
                             slack_attempted += 1
                             if send_slack_once(message):
                                 last_alert_at[best_pair] = time.time()
