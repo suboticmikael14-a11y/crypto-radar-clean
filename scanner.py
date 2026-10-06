@@ -47,7 +47,7 @@ CONFIRM_VOL_KEEP_RATIO = float(os.getenv("CONFIRM_VOL_KEEP_RATIO", "0.85"))
 CONFIRM_MAX_SPREAD = float(os.getenv("CONFIRM_MAX_SPREAD", "0.20"))
 
 HTTP_TIMEOUT = 15
-HISTORY_MAX_MIN = 35
+HISTORY_MAX_MIN = int(os.getenv("HISTORY_MAX_MIN", "450"))
 
 EXCLUDED_BASES = {
     "USDC", "USDE", "USDS", "FDUSD", "TUSD", "DAI", "PYUSD", "USD1",
@@ -104,6 +104,11 @@ class PilotState:
     best_score: int = 0
     best_vol_ratio: float = 0.0
     best_price: float = 0.0
+    min_price: float = 0.0
+    last_price: float = 0.0
+    last_score: int = 0
+    last_vol_ratio: float = 0.0
+    trajectory: deque = None
 
 
 @dataclass
@@ -351,7 +356,13 @@ def open_pilot(sig: Signal, now: float) -> bool:
         best_score=sig.score,
         best_vol_ratio=sig.vol_ratio,
         best_price=sig.price,
+        min_price=sig.price,
+        last_price=sig.price,
+        last_score=sig.score,
+        last_vol_ratio=sig.vol_ratio,
+        trajectory=deque(maxlen=90),
     )
+    pilots[sig.pair].trajectory.append((now, sig.price, sig.score, sig.vol_ratio, sig.ret_1m, sig.ret_5m, sig.ret_15m, sig.qv24, sig.spread_pct, sig.change_24h))
     print(
         f"PILOTE OUVERT — {sig.pair} | score={sig.score} | prix={sig.price:.10g} | "
         f"vol=x{sig.vol_ratio:.1f} | r1={sig.ret_1m:+.2f}% | "
@@ -376,6 +387,13 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
     pilot.best_score = max(pilot.best_score, sig.score)
     pilot.best_vol_ratio = max(pilot.best_vol_ratio, sig.vol_ratio)
     pilot.best_price = max(pilot.best_price, sig.price)
+    pilot.min_price = min(pilot.min_price or sig.price, sig.price)
+    pilot.last_price = sig.price
+    pilot.last_score = sig.score
+    pilot.last_vol_ratio = sig.vol_ratio
+    if pilot.trajectory is None:
+        pilot.trajectory = deque(maxlen=90)
+    pilot.trajectory.append((now, sig.price, sig.score, sig.vol_ratio, sig.ret_1m, sig.ret_5m, sig.ret_15m, sig.qv24, sig.spread_pct, sig.change_24h))
 
     age_sec = now - pilot.created_at
     age_min = age_sec / 60.0
