@@ -730,8 +730,7 @@ def ai_review_batch(candidates):
             timeout=AI_HTTP_TIMEOUT,
         )
         if r.status_code != 200:
-            body = (r.text or "")[:300].replace("
-", " ")
+            body = (r.text or "")[:300].replace(chr(10), " ")
             print(f"AI HTTP {r.status_code} — {body}", flush=True)
             return None
         raw = _response_text(r.json())
