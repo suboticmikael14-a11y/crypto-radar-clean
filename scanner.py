@@ -797,34 +797,20 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
     return (
-        f"🚨🟢 CRYPTO RADAR — TRADE
-"
-        f"{s.pair}
-
-"
-        f"Prix actuel : {s.price:.10g}
-"
-        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}
-"
-        f"Invalidation : {review.invalidation:.10g}
-"
-        f"TP1 : {review.tp1:.10g}
-"
-        f"TP2 : {review.tp2:.10g}
-"
-        f"Confiance IA : {review.confidence}/100
-
-"
-        f"Pourquoi : {review.reason}
-
-"
+        f"TRADE EXPLOITABLE MAINTENANT — CONFIRMATION/RENFORCEMENT\n"
+        f"{s.pair}\n\n"
+        f"Prix actuel : {s.price:.10g}\n"
+        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
+        f"Invalidation : {review.invalidation:.10g}\n"
+        f"TP1 : {review.tp1:.10g}\n"
+        f"TP2 : {review.tp2:.10g}\n"
+        f"Confiance IA : {review.confidence}/100\n\n"
+        f"Pourquoi : {review.reason}\n\n"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
-        f"spread {s.spread_pct:.3f}%
-"
-        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.
-"
-        f"Source marché : Gate.io | Filtre V2 + arbitrage IA V3"
+        f"spread {s.spread_pct:.3f}%\n"
+        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
+        f"Source marché : Gate.io | validation Crypto.com Exchange"
     )
 
 
