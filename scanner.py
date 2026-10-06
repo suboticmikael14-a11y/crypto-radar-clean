@@ -1016,6 +1016,17 @@ def run():
             commit_state(now)
             cleanup_expired_pilots(now)
 
+            # Circuit indépendant POSITIONS OUVERTES: une position reste surveillée
+            # même lorsqu'elle est volontairement exclue du circuit de nouvelle entrée.
+            for held_pair in list(positions.keys()):
+                t = by_pair.get(held_pair)
+                if not t:
+                    continue
+                held_price = fnum(t.get("last"))
+                action = position_action(held_pair, held_price)
+                if action:
+                    print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
+
             raw_signals = []
             for pair in list(history.keys()):
                 gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
@@ -1037,7 +1048,7 @@ def run():
                     confirmed.append(candidate)
 
             confirmed.sort(
-                key=lambda c: (c.signal.score, c.price_gain, c.signal.vol_ratio),
+                key=lambda c: (c.signal.score, -c.price_gain, c.signal.qv24, c.signal.vol_ratio),
                 reverse=True,
             )
 
