@@ -88,7 +88,9 @@ def init_state_db():
     _state_db.execute("CREATE INDEX IF NOT EXISTS idx_market_history_ts ON market_history(bucket_ts)")
     _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(time.time()) - 8*24*3600,))
     _state_db.commit()
-    print(f"PEPITO STATE — SQLite actif | {STATE_DB_PATH}", flush=True)
+    cur = _state_db.execute("SELECT COUNT(*), MIN(bucket_ts), MAX(bucket_ts) FROM market_history")
+    row = cur.fetchone() or (0, None, None)
+    print(f"PEPITO STATE — SQLite actif | {STATE_DB_PATH} | rows={row[0]} | oldest={row[1]} | newest={row[2]}", flush=True)
 
 def persist_market_snapshot(pair, snap):
     if _state_db is None:
