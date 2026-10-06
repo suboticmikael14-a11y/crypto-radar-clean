@@ -495,7 +495,7 @@ def score_signal(pair: str) -> Optional[Signal]:
     # n'est pas branché; flow utilise ici un proxy momentum conservateur.
     volume_pts = min(30, max(0, int((vol_ratio - 3.0) * 1.6)))
     flow_pts = min(20, max(0, int(max(ret1, 0) * 8 + max(ret5, 0) * 3)))
-    liquidity_pts = min(15, max(0, int(10 * (1 - spread / MAX_SPREAD_PCT) + min(5, max(0, math.log10(max(cur.qv24, 1)) - 5)))))
+    liquidity_pts = min(15, max(0, int(10 * (1 - spread / 0.50) + min(5, max(0, math.log10(max(cur.qv24, 1)) - 5)))))
     extension = max(abs(ret5), max(change24h, 0))
     unextended_pts = 15 if extension <= 2 else (10 if extension <= 5 else (4 if extension <= 10 else 0))
     structure_pts = min(10, max(0, int((max(ret5, 0) + max(ret15, 0) * 0.5) * 4)))
