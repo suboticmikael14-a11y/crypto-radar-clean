@@ -302,6 +302,10 @@ def score_signal(pair: str) -> Optional[Signal]:
     ret1 = pct(cur.price, s1.price)
     ret5 = pct(cur.price, s5.price)
     ret15 = pct(cur.price, s15.price) if s15 else 0.0
+    # 24h est enrichi depuis le ticker Gate après scoring; pour le scoring lui-même,
+    # on le calcule depuis l’historique local quand 24h est disponible, sinon 0.
+    s24 = closest_before(samples, 24 * 60 * 60 - 30)
+    change24h = pct(cur.price, s24.price) if s24 else 0.0
 
     spread = 999.0
     if cur.bid > 0 and cur.ask > 0 and cur.ask >= cur.bid:
@@ -363,7 +367,7 @@ def score_signal(pair: str) -> Optional[Signal]:
         vol_ratio=vol_ratio,
         qv24=cur.qv24,
         spread_pct=spread,
-        change_24h=0.0,
+        change_24h=change24h,
         score=score,
         level="RADAR INTERNE" if score < PILOT_SCORE else "ENTREE PILOTE",
     )
