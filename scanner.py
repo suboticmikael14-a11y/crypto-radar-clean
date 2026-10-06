@@ -573,37 +573,21 @@ def format_confirmed_alert(c: ConfirmedCandidate) -> str:
     s = c.signal
     p = c.pilot
     return (
-        f"✅ CRYPTO RADAR CLEAN — CONFIRME TRAJECTOIRE
-"
-        f"{s.pair}
-
-"
-        f"Score : {s.score}/100
-"
-        f"Prix pilote : {p.first_price:.10g}
-"
-        f"Prix actuel : {s.price:.10g}
-"
-        f"Progression depuis pilote : {c.price_gain:+.2f}%
-"
-        f"Temps depuis pilote : {c.age_min:.0f} min
-"
-        f"Volume relatif pilote : x{p.first_vol_ratio:.1f}
-"
-        f"Volume relatif actuel : x{s.vol_ratio:.1f}
-"
-        f"Variation ~1 min : {s.ret_1m:+.2f}%
-"
-        f"Variation ~5 min : {s.ret_5m:+.2f}%
-"
-        f"Variation ~15 min : {s.ret_15m:+.2f}%
-"
-        f"Volume 24 h : ${s.qv24:,.0f}
-"
-        f"Spread : {s.spread_pct:.3f}%
-"
-        f"Variation 24 h : {s.change_24h:+.2f}%
-"
+        f"✅ CRYPTO RADAR CLEAN — CONFIRME TRAJECTOIRE\n"
+        f"{s.pair}\n\n"
+        f"Score : {s.score}/100\n"
+        f"Prix pilote : {p.first_price:.10g}\n"
+        f"Prix actuel : {s.price:.10g}\n"
+        f"Progression depuis pilote : {c.price_gain:+.2f}%\n"
+        f"Temps depuis pilote : {c.age_min:.0f} min\n"
+        f"Volume relatif pilote : x{p.first_vol_ratio:.1f}\n"
+        f"Volume relatif actuel : x{s.vol_ratio:.1f}\n"
+        f"Variation ~1 min : {s.ret_1m:+.2f}%\n"
+        f"Variation ~5 min : {s.ret_5m:+.2f}%\n"
+        f"Variation ~15 min : {s.ret_15m:+.2f}%\n"
+        f"Volume 24 h : ${s.qv24:,.0f}\n"
+        f"Spread : {s.spread_pct:.3f}%\n"
+        f"Variation 24 h : {s.change_24h:+.2f}%\n"
         f"Source : Gate.io"
     )
 
