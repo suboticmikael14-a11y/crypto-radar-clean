@@ -13,7 +13,9 @@ GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "250000"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "6"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
+EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
+EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
 PILOT_SCORE = int(os.getenv("PILOT_SCORE", "78"))
 CONFIRMED_SCORE = int(os.getenv("CONFIRMED_SCORE", "90"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
@@ -240,11 +242,11 @@ def score_signal(pair: str) -> Optional[Signal]:
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
-    if vol_ratio < MIN_VOLUME_RATIO:
+    if vol_ratio < EARLY_MIN_VOLUME_RATIO:
         return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
-    if ret5 > 5.0 or ret15 > 10.0:
+    if ret5 > EARLY_MAX_RET5 or ret15 > 10.0:
         return None
 
     score = 0
@@ -293,7 +295,10 @@ def score_signal(pair: str) -> Optional[Signal]:
     elif cur.qv24 >= 500_000:
         score += 4
 
-    if score < PILOT_SCORE:
+    # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
+    # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
+    early_score_floor = max(35, PILOT_SCORE - 35)
+    if score < early_score_floor:
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
@@ -309,7 +314,7 @@ def score_signal(pair: str) -> Optional[Signal]:
         spread_pct=spread,
         change_24h=0.0,
         score=score,
-        level="ENTREE PILOTE",
+        level="RADAR INTERNE" if score < PILOT_SCORE else "ENTREE PILOTE",
     )
 
 
