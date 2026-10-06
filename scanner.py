@@ -89,44 +89,12 @@ def init_state_db():
     _state_db.execute("CREATE INDEX IF NOT EXISTS idx_market_history_ts ON market_history(bucket_ts)")
     _state_db.execute("""CREATE TABLE IF NOT EXISTS pilot_state (
         pair TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)""")
-    _state_db.execute("""CREATE TABLE IF NOT EXISTS pilot_state (
-        pair TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)""")
     _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(time.time()) - 8*24*3600,))
     _state_db.commit()
     _state_db.execute("VACUUM")
     cur = _state_db.execute("SELECT COUNT(*), MIN(bucket_ts), MAX(bucket_ts) FROM market_history")
     row = cur.fetchone() or (0, None, None)
     print(f"PEPITO STATE — SQLite actif | {STATE_DB_PATH} | rows={row[0]} | oldest={row[1]} | newest={row[2]}", flush=True)
-
-def persist_pilot_state(pair, pilot):
-    if _state_db is None or pilot is None:
-        return
-    payload = dict(pilot.__dict__)
-    payload["trajectory"] = list(pilot.trajectory or [])
-    _state_db.execute("""INSERT INTO pilot_state(pair,payload,updated_at) VALUES(?,?,?)
-        ON CONFLICT(pair) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
-        (pair, json.dumps(payload, separators=(",", ":")), time.time()))
-
-def restore_pilots(now):
-    if _state_db is None:
-        return 0
-    restored = 0
-    ttl = PILOT_TTL_MIN * 60
-    for pair, payload, updated_at in _state_db.execute("SELECT pair,payload,updated_at FROM pilot_state").fetchall():
-        try:
-            d = json.loads(payload)
-            if now - float(d.get("created_at", 0)) > ttl:
-                _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
-                continue
-            d["trajectory"] = deque(d.get("trajectory") or [], maxlen=90)
-            pilots[pair] = PilotState(**d)
-            restored += 1
-        except Exception as exc:
-            print(f"PEPITO RESTORE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
-            _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
-    _state_db.commit()
-    print(f"PEPITO PILOTES — {restored} restaure(s) depuis SQLite", flush=True)
-    return restored
 
 def persist_pilot_state(pair, pilot):
     if _state_db is None or pilot is None:
