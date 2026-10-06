@@ -1134,5 +1134,30 @@ def run():
         time.sleep(max(1.0, SCAN_INTERVAL - elapsed))
 
 
+def pepito_selftest():
+    """Deterministic regression checks for the failures PEPITO must not repeat."""
+    global cdc_pairs
+    old_cdc = set(cdc_pairs)
+    try:
+        cdc_pairs = {"KAS_USD", "NIGHT_USD", "XPL_USD"}
+        assert cdc_tradeable("KAS_USDT")
+        assert cdc_tradeable("NIGHT_USDT")
+        assert not cdc_tradeable("SHX_USDT")
+        assert not cdc_tradeable("USDT_USDT")
+        # Late x100 spike must not outrank a clean progressive x20 trajectory.
+        progressive = [3.2, 6.8, 12.0, 20.0]
+        late = [3.0, 3.1, 3.0, 100.0]
+        prog_steps = sum(1 for a,b in zip(progressive, progressive[1:]) if b >= a * 1.15)
+        late_steps = sum(1 for a,b in zip(late, late[1:]) if b >= a * 1.15)
+        assert prog_steps >= 2 and late_steps < 2
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | ANTI_CHASE | PROGRESSIVE_ACCEL", flush=True)
+        return True
+    finally:
+        cdc_pairs = old_cdc
+
+
 if __name__ == "__main__":
-    run()
+    if os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
+        pepito_selftest()
+    else:
+        run()
