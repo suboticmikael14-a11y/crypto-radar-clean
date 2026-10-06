@@ -286,51 +286,21 @@ def score_signal(pair: str) -> Optional[Signal]:
     if ret5 > EARLY_MAX_RET5 or ret15 > 10.0:
         return None
 
-    score = 0
+    # PEPITO scoring verrouillé: 30/20/15/15/10/10.
+    # Les données absentes ne sont jamais inventées: catalyst=0 tant qu'un flux fiable
+    # n'est pas branché; flow utilise ici un proxy momentum conservateur.
+    volume_pts = min(30, max(0, int((vol_ratio - 3.0) * 1.6)))
+    flow_pts = min(20, max(0, int(max(ret1, 0) * 8 + max(ret5, 0) * 3)))
+    liquidity_pts = min(15, max(0, int(10 * (1 - spread / MAX_SPREAD_PCT) + min(5, max(0, math.log10(max(cur.qv24, 1)) - 5))))
+    extension = max(abs(ret5), max(change24h, 0))
+    unextended_pts = 15 if extension <= 2 else (10 if extension <= 5 else (4 if extension <= 10 else 0))
+    structure_pts = min(10, max(0, int((max(ret5, 0) + max(ret15, 0) * 0.5) * 4)))
+    catalyst_pts = 0
+    score = volume_pts + flow_pts + liquidity_pts + unextended_pts + structure_pts + catalyst_pts
 
-    # Volume relatif: 35 pts max
-    if vol_ratio >= 20:
-        score += 35
-    elif vol_ratio >= 12:
-        score += 30
-    elif vol_ratio >= 8:
-        score += 24
-    elif vol_ratio >= 6:
-        score += 18
-
-    # Momentum 5 min: hausse visible mais encore modérée.
-    if 0.35 <= ret5 <= 2.5:
-        score += 25
-    elif 0.10 <= ret5 < 0.35:
-        score += 20
-    elif -0.25 <= ret5 < 0.10:
-        score += 12
-    elif 2.5 < ret5 <= 5.0:
-        score += 10
-
-    # Momentum 1 min
-    if 0.05 <= ret1 <= 1.2:
-        score += 15
-    elif -0.10 <= ret1 < 0.05:
-        score += 8
-    elif 1.2 < ret1 <= 2.0:
-        score += 6
-
-    # Spread
-    if spread <= 0.08:
-        score += 15
-    elif spread <= 0.15:
-        score += 12
-    elif spread <= 0.30:
-        score += 7
-
-    # Liquidité
-    if cur.qv24 >= 5_000_000:
-        score += 10
-    elif cur.qv24 >= 1_000_000:
-        score += 7
-    elif cur.qv24 >= 500_000:
-        score += 4
+    # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
+    if change24h > 15.0 or ret15 > 6.0:
+        return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
