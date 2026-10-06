@@ -586,7 +586,6 @@ def open_pilot(sig: Signal, now: float) -> bool:
     if history.get(sig.pair):
         persist_market_snapshot(sig.pair, history[sig.pair][-1])
     persist_pilot_state(sig.pair, pilots[sig.pair])
-    persist_pilot_state(sig.pair, pilots[sig.pair])
     print(
         f"PILOTE OUVERT — {sig.pair} | score={sig.score} | prix={sig.price:.10g} | "
         f"vol=x{sig.vol_ratio:.1f} | r1={sig.ret_1m:+.2f}% | "
@@ -621,7 +620,6 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
     if history.get(sig.pair):
         persist_market_snapshot(sig.pair, history[sig.pair][-1])
     persist_pilot_state(sig.pair, pilot)
-    persist_pilot_state(sig.pair, pilot)
 
     age_sec = now - pilot.created_at
     age_min = age_sec / 60.0
@@ -643,6 +641,27 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             or sig.vol_ratio >= 20.0
         )
     )
+
+    # PEPITO trajectory quality: reward progressive acceleration, penalize late spikes.
+    traj = list(pilot.trajectory or [])
+    recent_vols = [float(pt[3]) for pt in traj[-6:] if len(pt) > 3]
+    rising_steps = sum(1 for a, b in zip(recent_vols, recent_vols[1:]) if b >= a * 1.15)
+    trajectory_accel_ok = len(recent_vols) >= 3 and rising_steps >= 2
+    early_distance_ok = price_gain <= AI_MAX_PRICE_GAIN
+    late_spike = (
+        sig.vol_ratio >= 50.0
+        and not trajectory_accel_ok
+        and price_gain >= 3.0
+    )
+    if trajectory_accel_ok and early_distance_ok:
+        score_ok = score_ok or (sig.score >= max(PILOT_SCORE, CONFIRMED_SCORE - 5) and sig.vol_ratio >= 10.0)
+    if late_spike:
+        score_ok = False
+        print(
+            f"ANTI-CHASE TRAJECTOIRE — {sig.pair} | vol=x{sig.vol_ratio:.1f} | "
+            f"gain depuis pilote={price_gain:+.2f}% | progression volume insuffisante",
+            flush=True,
+        )
 
     momentum_floor_ok = (
         sig.ret_1m >= CONFIRM_MIN_RET1
