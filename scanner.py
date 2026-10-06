@@ -845,6 +845,8 @@ def run():
                 raw_signals.append(sig)
 
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
+            early_count = len(raw_signals)
+            cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
 
             confirmed = []
             for sig in raw_signals:
@@ -885,6 +887,7 @@ def run():
             due = due[:MAX_AI_REVIEWS_PER_SCAN]
             sent = 0
             ai_reviews_count = 0
+            slack_attempted = 0
 
             if due and AI_ENABLED and OPENAI_API_KEY:
                 result = ai_review_batch(due)
@@ -916,6 +919,7 @@ def run():
                         if review and candidate and validate_trade_review(review, candidate):
                             message = format_trade_alert(candidate, review)
                             print("\n" + message, flush=True)
+                            slack_attempted += 1
                             if send_slack_once(message):
                                 last_alert_at[best_pair] = time.time()
                                 pilots.pop(best_pair, None)
@@ -934,11 +938,10 @@ def run():
                 )
 
             print(
-                f"Scan terminé | {len(tickers)} tickers | "
-                f"{len(raw_signals)} pilote(s) actif(s) ce scan | "
-                f"{len(confirmed)} confirmation(s) V2 | {len(due)} revue(s) IA | "
-                f"{ai_reviews_count} décision(s) IA | {sent} TRADE Slack | "
-                f"{len(pilots)} pilote(s) suivi(s)",
+                f"PEPITO JOURNAL — SCANNED {len(tickers)} -> EARLY {early_count} -> "
+                f"TRACKED {len(pilots)} -> CONFIRMED {len(confirmed)} -> "
+                f"AI {len(due)} -> CDC AVAILABLE {cdc_count} -> "
+                f"SLACK ATTEMPTED {slack_attempted} -> SLACK SENT {sent}",
                 flush=True,
             )
 
