@@ -10,6 +10,7 @@ from typing import Optional
 import requests
 
 GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
+CDC_INSTRUMENTS_URL = "https://api.crypto.com/exchange/v1/public/get-instruments"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "250000"))
@@ -65,6 +66,9 @@ pilots = {}
 slack_blocked_until = 0.0
 last_slack_send_at = 0.0
 ai_next_review_at = {}
+cdc_pairs = set()
+cdc_pairs_updated_at = 0.0
+CDC_PAIRS_TTL_SEC = int(os.getenv("CDC_PAIRS_TTL_SEC", "3600"))
 
 
 @dataclass
@@ -161,6 +165,39 @@ def excluded_pair(pair: str) -> bool:
     if base.endswith(("3L", "3S", "5L", "5S")):
         return True
     return False
+
+
+def refresh_cdc_pairs(now=None):
+    """Whitelist réelle des instruments spot actifs Crypto.com Exchange."""
+    global cdc_pairs, cdc_pairs_updated_at
+    now = now or time.time()
+    if cdc_pairs and now - cdc_pairs_updated_at < CDC_PAIRS_TTL_SEC:
+        return cdc_pairs
+    r = session.get(CDC_INSTRUMENTS_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    payload = r.json()
+    data = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
+    fresh = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("symbol") or item.get("instrument_name") or "").upper().strip()
+        inst_type = str(item.get("inst_type") or item.get("type") or "").upper()
+        status = str(item.get("status") or "").upper()
+        if name and ("SPOT" in inst_type or not inst_type) and status not in {"SUSPENDED", "DISABLED", "INACTIVE"}:
+            fresh.add(name)
+    if not fresh:
+        raise RuntimeError("Whitelist Crypto.com Exchange vide")
+    cdc_pairs = fresh
+    cdc_pairs_updated_at = now
+    print(f"CDC WHITELIST — {len(cdc_pairs)} instruments spot", flush=True)
+    return cdc_pairs
+
+
+def cdc_tradeable(pair: str) -> bool:
+    base = base_of(pair).upper()
+    # Gate travaille en BASE_USDT; Crypto.com peut coter le même actif en USD/USDT.
+    return any(x in cdc_pairs for x in (f"{base}_USD", f"{base}_USDT", f"{base}-USD", f"{base}-USDT"))
 
 
 def fetch_tickers():
@@ -665,6 +702,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
     """Garde-fous déterministes avant toute notification Slack."""
     if review.decision != "TRADE" or review.confidence < 70:
         return False
+    if not cdc_tradeable(c.signal.pair):
+        print(f"TRADE BLOQUE CDC — {c.signal.pair} absent de Crypto.com Exchange spot", flush=True)
+        return False
     vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
     if any(v is None or v <= 0 for v in vals):
         return False
@@ -769,6 +809,12 @@ def run():
         try:
             tickers = fetch_tickers()
             now = time.time()
+            try:
+                refresh_cdc_pairs(now)
+            except Exception as exc:
+                # Fail closed: sans whitelist fiable, aucun TRADE ne doit partir.
+                cdc_pairs.clear()
+                print(f"CDC WHITELIST ERREUR — TRADE bloqué | {type(exc).__name__}: {exc}", flush=True)
             by_pair = {}
 
             for t in tickers:
