@@ -87,6 +87,7 @@ def init_state_db():
         PRIMARY KEY(pair,bucket_ts))""")
     _state_db.execute("CREATE INDEX IF NOT EXISTS idx_market_history_ts ON market_history(bucket_ts)")
     _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(time.time()) - 8*24*3600,))
+    _state_db.execute("VACUUM")
     _state_db.commit()
     cur = _state_db.execute("SELECT COUNT(*), MIN(bucket_ts), MAX(bucket_ts) FROM market_history")
     row = cur.fetchone() or (0, None, None)
@@ -320,7 +321,6 @@ def add_snapshot(ticker, now):
 
     snap = Snapshot(now, price, qv24, bid, ask)
     history[pair].append(snap)
-    persist_market_snapshot(pair, snap)
 
 
 def closest_before(samples, age_sec: int) -> Optional[Snapshot]:
@@ -478,6 +478,8 @@ def open_pilot(sig: Signal, now: float) -> bool:
         trajectory=deque(maxlen=90),
     )
     pilots[sig.pair].trajectory.append((now, sig.price, sig.score, sig.vol_ratio, sig.ret_1m, sig.ret_5m, sig.ret_15m, sig.qv24, sig.spread_pct, sig.change_24h))
+    if history.get(sig.pair):
+        persist_market_snapshot(sig.pair, history[sig.pair][-1])
     print(
         f"PILOTE OUVERT — {sig.pair} | score={sig.score} | prix={sig.price:.10g} | "
         f"vol=x{sig.vol_ratio:.1f} | r1={sig.ret_1m:+.2f}% | "
@@ -509,6 +511,8 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
     if pilot.trajectory is None:
         pilot.trajectory = deque(maxlen=90)
     pilot.trajectory.append((now, sig.price, sig.score, sig.vol_ratio, sig.ret_1m, sig.ret_5m, sig.ret_15m, sig.qv24, sig.spread_pct, sig.change_24h))
+    if history.get(sig.pair):
+        persist_market_snapshot(sig.pair, history[sig.pair][-1])
 
     age_sec = now - pilot.created_at
     age_min = age_sec / 60.0
