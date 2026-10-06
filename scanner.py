@@ -1026,6 +1026,8 @@ def run():
         print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
     init_state_db()
+    restore_pilots(time.time())
+    load_positions()
 
     while True:
         started = time.time()
