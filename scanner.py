@@ -316,7 +316,9 @@ def add_snapshot(ticker, now):
     if price <= 0 or qv24 <= 0:
         return
 
-    snap = Snapshot(now, price, qv24, bid, ask)\n    history[pair].append(snap)\n    persist_market_snapshot(pair, snap)
+    snap = Snapshot(now, price, qv24, bid, ask)
+    history[pair].append(snap)
+    persist_market_snapshot(pair, snap)
 
 
 def closest_before(samples, age_sec: int) -> Optional[Snapshot]:
@@ -571,21 +573,37 @@ def format_confirmed_alert(c: ConfirmedCandidate) -> str:
     s = c.signal
     p = c.pilot
     return (
-        f"✅ CRYPTO RADAR CLEAN — CONFIRME TRAJECTOIRE\n"
-        f"{s.pair}\n\n"
-        f"Score : {s.score}/100\n"
-        f"Prix pilote : {p.first_price:.10g}\n"
-        f"Prix actuel : {s.price:.10g}\n"
-        f"Progression depuis pilote : {c.price_gain:+.2f}%\n"
-        f"Temps depuis pilote : {c.age_min:.0f} min\n"
-        f"Volume relatif pilote : x{p.first_vol_ratio:.1f}\n"
-        f"Volume relatif actuel : x{s.vol_ratio:.1f}\n"
-        f"Variation ~1 min : {s.ret_1m:+.2f}%\n"
-        f"Variation ~5 min : {s.ret_5m:+.2f}%\n"
-        f"Variation ~15 min : {s.ret_15m:+.2f}%\n"
-        f"Volume 24 h : ${s.qv24:,.0f}\n"
-        f"Spread : {s.spread_pct:.3f}%\n"
-        f"Variation 24 h : {s.change_24h:+.2f}%\n"
+        f"✅ CRYPTO RADAR CLEAN — CONFIRME TRAJECTOIRE
+"
+        f"{s.pair}
+
+"
+        f"Score : {s.score}/100
+"
+        f"Prix pilote : {p.first_price:.10g}
+"
+        f"Prix actuel : {s.price:.10g}
+"
+        f"Progression depuis pilote : {c.price_gain:+.2f}%
+"
+        f"Temps depuis pilote : {c.age_min:.0f} min
+"
+        f"Volume relatif pilote : x{p.first_vol_ratio:.1f}
+"
+        f"Volume relatif actuel : x{s.vol_ratio:.1f}
+"
+        f"Variation ~1 min : {s.ret_1m:+.2f}%
+"
+        f"Variation ~5 min : {s.ret_5m:+.2f}%
+"
+        f"Variation ~15 min : {s.ret_15m:+.2f}%
+"
+        f"Volume 24 h : ${s.qv24:,.0f}
+"
+        f"Spread : {s.spread_pct:.3f}%
+"
+        f"Variation 24 h : {s.change_24h:+.2f}%
+"
         f"Source : Gate.io"
     )
 
@@ -728,7 +746,8 @@ def ai_review_batch(candidates):
             timeout=AI_HTTP_TIMEOUT,
         )
         if r.status_code != 200:
-            body = (r.text or "")[:300].replace("\n", " ")
+            body = (r.text or "")[:300].replace("
+", " ")
             print(f"AI HTTP {r.status_code} — {body}", flush=True)
             return None
         raw = _response_text(r.json())
@@ -795,19 +814,33 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
     return (
-        f"🚨🟢 CRYPTO RADAR — TRADE\n"
-        f"{s.pair}\n\n"
-        f"Prix actuel : {s.price:.10g}\n"
-        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
-        f"Invalidation : {review.invalidation:.10g}\n"
-        f"TP1 : {review.tp1:.10g}\n"
-        f"TP2 : {review.tp2:.10g}\n"
-        f"Confiance IA : {review.confidence}/100\n\n"
-        f"Pourquoi : {review.reason}\n\n"
+        f"🚨🟢 CRYPTO RADAR — TRADE
+"
+        f"{s.pair}
+
+"
+        f"Prix actuel : {s.price:.10g}
+"
+        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}
+"
+        f"Invalidation : {review.invalidation:.10g}
+"
+        f"TP1 : {review.tp1:.10g}
+"
+        f"TP2 : {review.tp2:.10g}
+"
+        f"Confiance IA : {review.confidence}/100
+
+"
+        f"Pourquoi : {review.reason}
+
+"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
-        f"spread {s.spread_pct:.3f}%\n"
-        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
+        f"spread {s.spread_pct:.3f}%
+"
+        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.
+"
         f"Source marché : Gate.io | Filtre V2 + arbitrage IA V3"
     )
 
@@ -873,7 +906,9 @@ def run():
     if AI_ENABLED and not OPENAI_API_KEY:
         print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
-    init_state_db()\n\n    while True:
+    init_state_db()
+
+    while True:
         started = time.time()
         try:
             tickers = fetch_tickers()
@@ -891,7 +926,8 @@ def run():
                 by_pair[pair] = t
                 add_snapshot(t, now)
 
-            commit_state(now)\n            cleanup_expired_pilots(now)
+            commit_state(now)
+            cleanup_expired_pilots(now)
 
             raw_signals = []
             for pair in list(history.keys()):
@@ -975,7 +1011,8 @@ def run():
                         candidate = by_candidate.get(best_pair)
                         if review and candidate and validate_trade_review(review, candidate):
                             message = format_trade_alert(candidate, review)
-                            print("\n" + message, flush=True)
+                            print("
+" + message, flush=True)
                             slack_attempted += 1
                             if send_slack_once(message):
                                 last_alert_at[best_pair] = time.time()
