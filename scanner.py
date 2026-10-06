@@ -11,6 +11,7 @@ from typing import Optional
 import requests
 
 GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
+GATE_CANDLES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 CDC_INSTRUMENTS_URL = "https://api.crypto.com/exchange/v1/public/get-instruments"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
@@ -174,19 +175,55 @@ def commit_state(now):
         _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(now)-8*24*3600,))
         _state_db.commit()
 
+def gate_historical_context(pair, now):
+    """Compact 6h/24h/7d context from Gate hourly candles; fetched only for candidates."""
+    try:
+        r = session.get(GATE_CANDLES_URL, params={"currency_pair": pair, "interval": "1h", "limit": 168}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        candles = r.json()
+        parsed = []
+        for row in candles if isinstance(candles, list) else []:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            ts = int(float(row[0]))
+            close = fnum(row[2])
+            quote_vol = fnum(row[1])
+            if ts > 0 and close > 0:
+                parsed.append((ts, close, quote_vol))
+        parsed.sort(key=lambda x: x[0])
+        if not parsed:
+            return {}
+        current = parsed[-1][1]
+        out = {}
+        for label, sec in (("6h",21600),("24h",86400),("7d",604800)):
+            eligible = [x for x in parsed if x[0] <= now-sec]
+            if eligible:
+                x = eligible[-1]
+                out[label] = {"price": x[1], "return_pct": pct(current, x[1]), "hour_quote_volume": x[2], "source": "gate_1h"}
+        return out
+    except Exception as exc:
+        print(f"PEPITO CONTEXTE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
+        return {}
+
 def persistent_context(pair, now):
-    if _state_db is None:
-        return {}
-    rows = _state_db.execute("SELECT bucket_ts,price,qv24 FROM market_history WHERE pair=? AND bucket_ts>=? ORDER BY bucket_ts",
-        (pair,int(now)-7*24*3600)).fetchall()
-    if not rows:
-        return {}
+    if _state_db is not None:
+        rows = _state_db.execute("SELECT bucket_ts,price,qv24 FROM market_history WHERE pair=? AND bucket_ts>=? ORDER BY bucket_ts",
+            (pair,int(now)-7*24*3600)).fetchall()
+    else:
+        rows = []
     out = {}
-    for label,sec in (("6h",21600),("24h",86400),("7d",604800)):
-        eligible=[r for r in rows if r[0] <= now-sec]
-        if eligible:
-            r=eligible[-1]
-            out[label]={"price":r[1],"return_pct":pct(rows[-1][1],r[1]),"qv24":r[2]}
+    if rows:
+        for label,sec in (("6h",21600),("24h",86400),("7d",604800)):
+            eligible=[r for r in rows if r[0] <= now-sec]
+            if eligible:
+                r=eligible[-1]
+                out[label]={"price":r[1],"return_pct":pct(rows[-1][1],r[1]),"qv24":r[2],"source":"pepito_sqlite"}
+    # Fill missing horizons without storing 2203 markets continuously.
+    if len(out) < 3:
+        gate = gate_historical_context(pair, now)
+        for label in ("6h","24h","7d"):
+            if label not in out and label in gate:
+                out[label] = gate[label]
     return out
 
 def load_positions():
