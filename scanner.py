@@ -714,6 +714,22 @@ def _candidate_payload(c: ConfirmedCandidate):
         "pilot_ret_5m_pct": round(p.first_ret_5m, 4),
         "pilot_ret_15m_pct": round(p.first_ret_15m, 4),
         "sightings": p.sightings,
+        "trajectory": [
+            {
+                "age_min": round((time.time() - pt[0]) / 60.0, 1),
+                "price": pt[1],
+                "score": pt[2],
+                "vol_ratio": round(pt[3], 2),
+                "ret_1m_pct": round(pt[4], 4),
+                "ret_5m_pct": round(pt[5], 4),
+                "ret_15m_pct": round(pt[6], 4),
+                "quote_volume_24h_usd": round(pt[7], 2),
+                "spread_pct": round(pt[8], 5),
+                "change_24h_pct": round(pt[9], 4),
+            }
+            for pt in list(p.trajectory or [])[-12:]
+        ],
+        "persistent_context": persistent_context(s.pair, time.time()),
     }
 
 
