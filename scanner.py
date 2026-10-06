@@ -3,6 +3,7 @@ import os
 import time
 import statistics
 import json
+import sqlite3
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional
@@ -70,6 +71,56 @@ cdc_pairs = set()
 cdc_pairs_updated_at = 0.0
 positions = {}
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", "pepito.sqlite3")
+_state_db = None
+
+def init_state_db():
+    global _state_db
+    parent = os.path.dirname(STATE_DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    _state_db = sqlite3.connect(STATE_DB_PATH, timeout=10)
+    _state_db.execute("PRAGMA journal_mode=WAL")
+    _state_db.execute("""CREATE TABLE IF NOT EXISTS market_history (
+        pair TEXT NOT NULL, bucket_ts INTEGER NOT NULL, price REAL NOT NULL,
+        qv24 REAL NOT NULL, bid REAL NOT NULL, ask REAL NOT NULL,
+        PRIMARY KEY(pair,bucket_ts))""")
+    _state_db.execute("CREATE INDEX IF NOT EXISTS idx_market_history_ts ON market_history(bucket_ts)")
+    _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(time.time()) - 8*24*3600,))
+    _state_db.commit()
+    print(f"PEPITO STATE — SQLite actif | {STATE_DB_PATH}", flush=True)
+
+def persist_market_snapshot(pair, snap):
+    if _state_db is None:
+        return
+    bucket = int(snap.ts // 300) * 300
+    _state_db.execute("""INSERT INTO market_history(pair,bucket_ts,price,qv24,bid,ask)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(pair,bucket_ts) DO UPDATE SET
+        price=excluded.price,qv24=excluded.qv24,bid=excluded.bid,ask=excluded.ask""",
+        (pair,bucket,snap.price,snap.qv24,snap.bid,snap.ask))
+
+def commit_state(now):
+    if _state_db is None:
+        return
+    _state_db.commit()
+    if int(now//3600) != int((now-SCAN_INTERVAL)//3600):
+        _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(now)-8*24*3600,))
+        _state_db.commit()
+
+def persistent_context(pair, now):
+    if _state_db is None:
+        return {}
+    rows = _state_db.execute("SELECT bucket_ts,price,qv24 FROM market_history WHERE pair=? AND bucket_ts>=? ORDER BY bucket_ts",
+        (pair,int(now)-7*24*3600)).fetchall()
+    if not rows:
+        return {}
+    out = {}
+    for label,sec in (("6h",21600),("24h",86400),("7d",604800)):
+        eligible=[r for r in rows if r[0] <= now-sec]
+        if eligible:
+            r=eligible[-1]
+            out[label]={"price":r[1],"return_pct":pct(rows[-1][1],r[1]),"qv24":r[2]}
+    return out
 
 def load_positions():
     global positions
@@ -265,7 +316,7 @@ def add_snapshot(ticker, now):
     if price <= 0 or qv24 <= 0:
         return
 
-    history[pair].append(Snapshot(now, price, qv24, bid, ask))
+    snap = Snapshot(now, price, qv24, bid, ask)\n    history[pair].append(snap)\n    persist_market_snapshot(pair, snap)
 
 
 def closest_before(samples, age_sec: int) -> Optional[Snapshot]:
@@ -822,7 +873,7 @@ def run():
     if AI_ENABLED and not OPENAI_API_KEY:
         print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
-    while True:
+    init_state_db()\n\n    while True:
         started = time.time()
         try:
             tickers = fetch_tickers()
@@ -840,7 +891,7 @@ def run():
                 by_pair[pair] = t
                 add_snapshot(t, now)
 
-            cleanup_expired_pilots(now)
+            commit_state(now)\n            cleanup_expired_pilots(now)
 
             raw_signals = []
             for pair in list(history.keys()):
