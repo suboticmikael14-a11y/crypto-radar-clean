@@ -68,6 +68,46 @@ last_slack_send_at = 0.0
 ai_next_review_at = {}
 cdc_pairs = set()
 cdc_pairs_updated_at = 0.0
+positions = {}
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
+
+def load_positions():
+    global positions
+    try:
+        with open(POSITIONS_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        positions = raw if isinstance(raw, dict) else {}
+        print(f"POSITIONS OUVERTES — {len(positions)} chargee(s)", flush=True)
+    except FileNotFoundError:
+        positions = {}
+    except Exception as exc:
+        positions = {}
+        print(f"POSITIONS ERREUR LECTURE — {type(exc).__name__}: {exc}", flush=True)
+
+def save_positions():
+    tmp = POSITIONS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(positions, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, POSITIONS_FILE)
+
+def position_action(pair, price):
+    p = positions.get(pair)
+    if not p or price <= 0:
+        return None
+    entry = float(p.get("entry_price") or 0)
+    stop = float(p.get("invalidation") or 0)
+    tp1 = float(p.get("tp1") or 0)
+    tp2 = float(p.get("tp2") or 0)
+    if stop and price <= stop:
+        return "SORTIR"
+    if tp2 and price >= tp2:
+        return "VENDRE DAVANTAGE"
+    if tp1 and price >= tp1:
+        return "PRENDRE DES BENEFICES"
+    if entry and price >= entry * 1.08:
+        return "NE PLUS RENFORCER"
+    return None
+
 CDC_PAIRS_TTL_SEC = int(os.getenv("CDC_PAIRS_TTL_SEC", "3600"))
 
 
@@ -211,6 +251,8 @@ def fetch_tickers():
 
 def add_snapshot(ticker, now):
     pair = ticker.get("currency_pair", "")
+    if pair in positions:
+        return None
     if excluded_pair(pair):
         return
 
