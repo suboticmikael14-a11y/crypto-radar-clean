@@ -337,9 +337,18 @@ def refresh_cdc_pairs(now=None):
     now = now or time.time()
     if cdc_pairs and now - cdc_pairs_updated_at < CDC_PAIRS_TTL_SEC:
         return cdc_pairs
-    r = session.get(CDC_INSTRUMENTS_URL, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    payload = r.json()
+    try:
+        r = session.get(CDC_INSTRUMENTS_URL, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:
+        cache_age = now - cdc_pairs_updated_at if cdc_pairs_updated_at else float("inf")
+        # A transient Crypto.com outage must not erase a whitelist we just verified.
+        # Beyond 6h (or before the first successful fetch), remain fail-closed.
+        if cdc_pairs and cache_age <= 6 * 60 * 60:
+            print(f"CDC WHITELIST — cache last-good utilisé | age={cache_age/60:.0f}m | {type(exc).__name__}", flush=True)
+            return cdc_pairs
+        raise
     data = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
     fresh = set()
     for item in data:
@@ -660,11 +669,19 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             age_min=age_min,
         )
 
+    failed_gates = [
+        name for name, ok in (
+            ("score", score_ok), ("age", age_ok), ("price", price_ok),
+            ("spread", spread_ok), ("extension", extended_ok), ("volume", volume_ok),
+            ("momentum", momentum_floor_ok), ("improvement", momentum_improved),
+            ("sightings", pilot.sightings >= 2),
+        ) if not ok
+    ]
     print(
         f"PILOTE SUIVI — {sig.pair} | age={age_min:.0f}m | vues={pilot.sightings} | "
         f"score={sig.score} | gain={price_gain:+.2f}% | vol=x{sig.vol_ratio:.1f} | "
         f"r5={sig.ret_5m:+.2f}% | r15={sig.ret_15m:+.2f}% | "
-        f"24h={sig.change_24h:+.2f}%",
+        f"24h={sig.change_24h:+.2f}% | BLOQUE={','.join(failed_gates) or 'aucun'}",
         flush=True,
     )
     return None
@@ -1151,9 +1168,10 @@ def pepito_selftest():
     global cdc_pairs
     old_cdc = set(cdc_pairs)
     try:
-        cdc_pairs = {"KAS_USD", "NIGHT_USD", "XPL_USD"}
-        assert cdc_tradeable("KAS_USDT")
+        cdc_pairs = {"NIGHT_USD", "XPL_USD"}
         assert cdc_tradeable("NIGHT_USDT")
+        assert cdc_tradeable("XPL_USDT")
+        assert not cdc_tradeable("KAS_USDT")
         assert not cdc_tradeable("SHX_USDT")
         assert not cdc_tradeable("USDT_USDT")
         # Late x100 spike must not outrank a clean progressive x20 trajectory.
