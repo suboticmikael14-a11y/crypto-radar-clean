@@ -419,7 +419,7 @@ def minute_volume_deltas(samples):
     return out
 
 
-def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[Signal]:
+def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False) -> Optional[Signal]:
     samples = history[pair]
     if len(samples) < 7:
         return None
@@ -459,7 +459,10 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
-    if vol_ratio < EARLY_MIN_VOLUME_RATIO:
+    # A new candidate must cross the early trigger. An existing pilot is different:
+    # keep measuring its trajectory even after the anomaly cools down, otherwise
+    # TRACKED pilots become dead memory and can never prove continuation/failure.
+    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO:
         return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
@@ -485,7 +488,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
-    if score < early_score_floor:
+    if not tracking and score < early_score_floor:
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
@@ -1046,19 +1049,33 @@ def run():
                     print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
 
             raw_signals = []
+            signal_by_pair = {}
             for pair in list(history.keys()):
                 gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
                 sig = score_signal(pair, gate24)
                 if not sig:
                     continue
                 raw_signals.append(sig)
+                signal_by_pair[pair] = sig
 
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
             early_count = len(raw_signals)
             cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
 
+            # Multi-pass follow-up is independent from the initial anomaly trigger.
+            # Every live pilot gets a tracking score each cycle, even when vol_ratio
+            # has cooled below EARLY_MIN_VOLUME_RATIO.
+            tracked_signals = []
+            for pair in list(pilots.keys()):
+                if pair in positions or pair in signal_by_pair or pair not in history:
+                    continue
+                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
+                sig = score_signal(pair, gate24, tracking=True)
+                if sig:
+                    tracked_signals.append(sig)
+
             confirmed = []
-            for sig in raw_signals:
+            for sig in raw_signals + tracked_signals:
                 if sig.pair in positions:
                     continue
                 candidate = evaluate_trajectory(sig, now)
@@ -1150,7 +1167,7 @@ def run():
 
             print(
                 f"PEPITO JOURNAL — SCANNED {len(tickers)} -> EARLY {early_count} -> "
-                f"TRACKED {len(pilots)} -> CONFIRMED {len(confirmed)} -> "
+                f"TRACKED {len(pilots)} (REEVAL {len(tracked_signals)}) -> CONFIRMED {len(confirmed)} -> "
                 f"AI {len(due)} -> CDC AVAILABLE {cdc_count} -> "
                 f"SLACK ATTEMPTED {slack_attempted} -> SLACK SENT {sent}",
                 flush=True,
