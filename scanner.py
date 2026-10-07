@@ -127,6 +127,33 @@ def restore_pilots(now):
     print(f"PEPITO PILOTES — {restored} restaure(s) depuis SQLite", flush=True)
     return restored
 
+def restore_pilot_history(now):
+    """Restore recent snapshots for live pilots so multi-pass tracking survives restarts."""
+    if _state_db is None or not pilots:
+        return 0
+    restored = 0
+    cutoff = int(now) - HISTORY_MAX_MIN * 60
+    for pair in list(pilots.keys()):
+        rows = _state_db.execute(
+            "SELECT bucket_ts,price,qv24,bid,ask FROM market_history "
+            "WHERE pair=? AND bucket_ts>=? ORDER BY bucket_ts",
+            (pair, cutoff),
+        ).fetchall()
+        if not rows:
+            continue
+        dq = history[pair]
+        dq.clear()
+        for ts, price, qv24, bid, ask in rows:
+            dq.append(Snapshot(float(ts), float(price), float(qv24), float(bid), float(ask)))
+            restored += 1
+    print(
+        f"PEPITO HISTORIQUE — {restored} snapshot(s) restaure(s) pour "
+        f"{sum(1 for p in pilots if history.get(p))} pilote(s)",
+        flush=True,
+    )
+    return restored
+
+
 def persist_market_snapshot(pair, snap):
     if _state_db is None:
         return
@@ -337,9 +364,18 @@ def refresh_cdc_pairs(now=None):
     now = now or time.time()
     if cdc_pairs and now - cdc_pairs_updated_at < CDC_PAIRS_TTL_SEC:
         return cdc_pairs
-    r = session.get(CDC_INSTRUMENTS_URL, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    payload = r.json()
+    try:
+        r = session.get(CDC_INSTRUMENTS_URL, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:
+        cache_age = now - cdc_pairs_updated_at if cdc_pairs_updated_at else float("inf")
+        # A transient Crypto.com outage must not erase a whitelist we just verified.
+        # Beyond 6h (or before the first successful fetch), remain fail-closed.
+        if cdc_pairs and cache_age <= 6 * 60 * 60:
+            print(f"CDC WHITELIST — cache last-good utilisé | age={cache_age/60:.0f}m | {type(exc).__name__}", flush=True)
+            return cdc_pairs
+        raise
     data = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
     fresh = set()
     for item in data:
@@ -410,7 +446,7 @@ def minute_volume_deltas(samples):
     return out
 
 
-def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[Signal]:
+def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False) -> Optional[Signal]:
     samples = history[pair]
     if len(samples) < 7:
         return None
@@ -450,7 +486,10 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
-    if vol_ratio < EARLY_MIN_VOLUME_RATIO:
+    # A new candidate must cross the early trigger. An existing pilot is different:
+    # keep measuring its trajectory even after the anomaly cools down, otherwise
+    # TRACKED pilots become dead memory and can never prove continuation/failure.
+    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO:
         return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
@@ -476,7 +515,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None) -> Optional[
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
-    if score < early_score_floor:
+    if not tracking and score < early_score_floor:
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
@@ -660,11 +699,19 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             age_min=age_min,
         )
 
+    failed_gates = [
+        name for name, ok in (
+            ("score", score_ok), ("age", age_ok), ("price", price_ok),
+            ("spread", spread_ok), ("extension", extended_ok), ("volume", volume_ok),
+            ("momentum", momentum_floor_ok), ("improvement", momentum_improved),
+            ("sightings", pilot.sightings >= 2),
+        ) if not ok
+    ]
     print(
         f"PILOTE SUIVI — {sig.pair} | age={age_min:.0f}m | vues={pilot.sightings} | "
         f"score={sig.score} | gain={price_gain:+.2f}% | vol=x{sig.vol_ratio:.1f} | "
         f"r5={sig.ret_5m:+.2f}% | r15={sig.ret_15m:+.2f}% | "
-        f"24h={sig.change_24h:+.2f}%",
+        f"24h={sig.change_24h:+.2f}% | BLOQUE={','.join(failed_gates) or 'aucun'}",
         flush=True,
     )
     return None
@@ -993,7 +1040,9 @@ def run():
         print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
     init_state_db()
-    restore_pilots(time.time())
+    startup_now = time.time()
+    restore_pilots(startup_now)
+    restore_pilot_history(startup_now)
     load_positions()
 
     while True:
@@ -1029,19 +1078,33 @@ def run():
                     print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
 
             raw_signals = []
+            signal_by_pair = {}
             for pair in list(history.keys()):
                 gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
                 sig = score_signal(pair, gate24)
                 if not sig:
                     continue
                 raw_signals.append(sig)
+                signal_by_pair[pair] = sig
 
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
             early_count = len(raw_signals)
             cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
 
+            # Multi-pass follow-up is independent from the initial anomaly trigger.
+            # Every live pilot gets a tracking score each cycle, even when vol_ratio
+            # has cooled below EARLY_MIN_VOLUME_RATIO.
+            tracked_signals = []
+            for pair in list(pilots.keys()):
+                if pair in positions or pair in signal_by_pair or pair not in history:
+                    continue
+                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
+                sig = score_signal(pair, gate24, tracking=True)
+                if sig:
+                    tracked_signals.append(sig)
+
             confirmed = []
-            for sig in raw_signals:
+            for sig in raw_signals + tracked_signals:
                 if sig.pair in positions:
                     continue
                 candidate = evaluate_trajectory(sig, now)
@@ -1133,7 +1196,7 @@ def run():
 
             print(
                 f"PEPITO JOURNAL — SCANNED {len(tickers)} -> EARLY {early_count} -> "
-                f"TRACKED {len(pilots)} -> CONFIRMED {len(confirmed)} -> "
+                f"TRACKED {len(pilots)} (REEVAL {len(tracked_signals)}) -> CONFIRMED {len(confirmed)} -> "
                 f"AI {len(due)} -> CDC AVAILABLE {cdc_count} -> "
                 f"SLACK ATTEMPTED {slack_attempted} -> SLACK SENT {sent}",
                 flush=True,
@@ -1147,25 +1210,71 @@ def run():
 
 
 def pepito_selftest():
-    """Deterministic regression checks for the failures PEPITO must not repeat."""
-    global cdc_pairs
+    """Deterministic regression suite for PEPITO's known failure modes."""
+    global cdc_pairs, positions
     old_cdc = set(cdc_pairs)
+    old_positions = dict(positions)
+    old_history = dict(history)
+    now = 1_800_000_000.0
+
+    def synthetic_signal(pair="NIGHT_USDT", price=1.01, qv24=5_000_000, spread=0.10,
+                         change24=1.0, score=92, vol=20.0, r1=0.15, r5=0.50, r15=0.80):
+        return Signal(pair, price, r1, r5, r15, vol, qv24, spread, change24, score, "ENTREE PILOTE")
+
+    def candidate(pair):
+        sig = synthetic_signal(pair=pair)
+        pilot = PilotState(now-600, now, 1.0, 80, 3.2, 0.05, 0.10, 0.15, 0.0,
+                           sightings=4, best_score=92, best_vol_ratio=20.0,
+                           best_price=1.01, min_price=1.0, last_price=1.01,
+                           last_score=92, last_vol_ratio=20.0,
+                           trajectory=deque(maxlen=90))
+        return ConfirmedCandidate(sig, pilot, 1.0, 10.0)
+
+    def review(pair):
+        return AIReview(pair, "TRADE", 90, "fixture", 0.99, 1.01, 0.97, 1.05, 1.10)
+
     try:
-        cdc_pairs = {"KAS_USD", "NIGHT_USD", "XPL_USD"}
-        assert cdc_tradeable("KAS_USDT")
-        assert cdc_tradeable("NIGHT_USDT")
-        assert not cdc_tradeable("SHX_USDT")
+        # 1) Real-exchange gate regression: NIGHT/XPL pass fixture; KAS/SHX never TRADE.
+        cdc_pairs = {"NIGHT_USD", "XPL_USD"}
+        assert cdc_tradeable("NIGHT_USDT") and cdc_tradeable("XPL_USDT")
+        assert not cdc_tradeable("KAS_USDT") and not cdc_tradeable("SHX_USDT")
         assert not cdc_tradeable("USDT_USDT")
-        # Late x100 spike must not outrank a clean progressive x20 trajectory.
+        assert validate_trade_review(review("NIGHT_USDT"), candidate("NIGHT_USDT"))
+        assert not validate_trade_review(review("KAS_USDT"), candidate("KAS_USDT"))
+        assert not validate_trade_review(review("SHX_USDT"), candidate("SHX_USDT"))
+
+        # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
-        prog_steps = sum(1 for a,b in zip(progressive, progressive[1:]) if b >= a * 1.15)
-        late_steps = sum(1 for a,b in zip(late, late[1:]) if b >= a * 1.15)
+        prog_steps = sum(1 for x,y in zip(progressive, progressive[1:]) if y >= x*1.15)
+        late_steps = sum(1 for x,y in zip(late, late[1:]) if y >= x*1.15)
         assert prog_steps >= 2 and late_steps < 2
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | ANTI_CHASE | PROGRESSIVE_ACCEL", flush=True)
+
+        # 3) Low absolute liquidity is rejected before spectacular relative volume matters.
+        lp="SELFLOW_USDT"; history[lp].clear()
+        for i,qv in enumerate([100000,100001,100002,100003,100004,100005,100105]):
+            history[lp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
+        assert score_signal(lp, 0.0) is None
+
+        # 4) Anti-chase: a +20% 24h token is rejected.
+        hp="SELFCHASE_USDT"; history[hp].clear()
+        for i,qv in enumerate([2_000_000,2_000_001,2_000_002,2_000_003,2_000_004,2_000_005,2_000_105]):
+            history[hp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
+        assert score_signal(hp, 20.0) is None
+
+        # 5) Position circuit: stop, TP1 and TP2 actions remain deterministic.
+        positions = {"SELF_USDT":{"entry_price":1.0,"invalidation":0.90,"tp1":1.10,"tp2":1.20}}
+        assert position_action("SELF_USDT",0.89) == "SORTIR"
+        assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
+        assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
+
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
+        positions = old_positions
+        history.pop("SELFLOW_USDT", None)
+        history.pop("SELFCHASE_USDT", None)
 
 
 if __name__ == "__main__":
