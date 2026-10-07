@@ -1210,26 +1210,71 @@ def run():
 
 
 def pepito_selftest():
-    """Deterministic regression checks for the failures PEPITO must not repeat."""
-    global cdc_pairs
+    """Deterministic regression suite for PEPITO's known failure modes."""
+    global cdc_pairs, positions
     old_cdc = set(cdc_pairs)
+    old_positions = dict(positions)
+    old_history = dict(history)
+    now = 1_800_000_000.0
+
+    def synthetic_signal(pair="NIGHT_USDT", price=1.01, qv24=5_000_000, spread=0.10,
+                         change24=1.0, score=92, vol=20.0, r1=0.15, r5=0.50, r15=0.80):
+        return Signal(pair, price, r1, r5, r15, vol, qv24, spread, change24, score, "ENTREE PILOTE")
+
+    def candidate(pair):
+        sig = synthetic_signal(pair=pair)
+        pilot = PilotState(now-600, now, 1.0, 80, 3.2, 0.05, 0.10, 0.15, 0.0,
+                           sightings=4, best_score=92, best_vol_ratio=20.0,
+                           best_price=1.01, min_price=1.0, last_price=1.01,
+                           last_score=92, last_vol_ratio=20.0,
+                           trajectory=deque(maxlen=90))
+        return ConfirmedCandidate(sig, pilot, 1.0, 10.0)
+
+    def review(pair):
+        return AIReview(pair, "TRADE", 90, "fixture", 0.99, 1.01, 0.97, 1.05, 1.10)
+
     try:
+        # 1) Real-exchange gate regression: NIGHT/XPL pass fixture; KAS/SHX never TRADE.
         cdc_pairs = {"NIGHT_USD", "XPL_USD"}
-        assert cdc_tradeable("NIGHT_USDT")
-        assert cdc_tradeable("XPL_USDT")
-        assert not cdc_tradeable("KAS_USDT")
-        assert not cdc_tradeable("SHX_USDT")
+        assert cdc_tradeable("NIGHT_USDT") and cdc_tradeable("XPL_USDT")
+        assert not cdc_tradeable("KAS_USDT") and not cdc_tradeable("SHX_USDT")
         assert not cdc_tradeable("USDT_USDT")
-        # Late x100 spike must not outrank a clean progressive x20 trajectory.
+        assert validate_trade_review(review("NIGHT_USDT"), candidate("NIGHT_USDT"))
+        assert not validate_trade_review(review("KAS_USDT"), candidate("KAS_USDT"))
+        assert not validate_trade_review(review("SHX_USDT"), candidate("SHX_USDT"))
+
+        # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
-        prog_steps = sum(1 for a,b in zip(progressive, progressive[1:]) if b >= a * 1.15)
-        late_steps = sum(1 for a,b in zip(late, late[1:]) if b >= a * 1.15)
+        prog_steps = sum(1 for x,y in zip(progressive, progressive[1:]) if y >= x*1.15)
+        late_steps = sum(1 for x,y in zip(late, late[1:]) if y >= x*1.15)
         assert prog_steps >= 2 and late_steps < 2
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | ANTI_CHASE | PROGRESSIVE_ACCEL", flush=True)
+
+        # 3) Low absolute liquidity is rejected before spectacular relative volume matters.
+        lp="SELFLOW_USDT"; history[lp].clear()
+        for i,qv in enumerate([100000,100001,100002,100003,100004,100005,100105]):
+            history[lp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
+        assert score_signal(lp, 0.0) is None
+
+        # 4) Anti-chase: a +20% 24h token is rejected.
+        hp="SELFCHASE_USDT"; history[hp].clear()
+        for i,qv in enumerate([2_000_000,2_000_001,2_000_002,2_000_003,2_000_004,2_000_005,2_000_105]):
+            history[hp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
+        assert score_signal(hp, 20.0) is None
+
+        # 5) Position circuit: stop, TP1 and TP2 actions remain deterministic.
+        positions = {"SELF_USDT":{"entry_price":1.0,"invalidation":0.90,"tp1":1.10,"tp2":1.20}}
+        assert position_action("SELF_USDT",0.89) == "SORTIR"
+        assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
+        assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
+
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
+        positions = old_positions
+        history.pop("SELFLOW_USDT", None)
+        history.pop("SELFCHASE_USDT", None)
 
 
 if __name__ == "__main__":
