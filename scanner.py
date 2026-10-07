@@ -127,6 +127,33 @@ def restore_pilots(now):
     print(f"PEPITO PILOTES — {restored} restaure(s) depuis SQLite", flush=True)
     return restored
 
+def restore_pilot_history(now):
+    """Restore recent snapshots for live pilots so multi-pass tracking survives restarts."""
+    if _state_db is None or not pilots:
+        return 0
+    restored = 0
+    cutoff = int(now) - HISTORY_MAX_MIN * 60
+    for pair in list(pilots.keys()):
+        rows = _state_db.execute(
+            "SELECT bucket_ts,price,qv24,bid,ask FROM market_history "
+            "WHERE pair=? AND bucket_ts>=? ORDER BY bucket_ts",
+            (pair, cutoff),
+        ).fetchall()
+        if not rows:
+            continue
+        dq = history[pair]
+        dq.clear()
+        for ts, price, qv24, bid, ask in rows:
+            dq.append(Snapshot(float(ts), float(price), float(qv24), float(bid), float(ask)))
+            restored += 1
+    print(
+        f"PEPITO HISTORIQUE — {restored} snapshot(s) restaure(s) pour "
+        f"{sum(1 for p in pilots if history.get(p))} pilote(s)",
+        flush=True,
+    )
+    return restored
+
+
 def persist_market_snapshot(pair, snap):
     if _state_db is None:
         return
@@ -1013,7 +1040,9 @@ def run():
         print("V3 ATTENTION — OPENAI_API_KEY absent: aucun Slack TRADE ne sera envoyé.", flush=True)
 
     init_state_db()
-    restore_pilots(time.time())
+    startup_now = time.time()
+    restore_pilots(startup_now)
+    restore_pilot_history(startup_now)
     load_positions()
 
     while True:
