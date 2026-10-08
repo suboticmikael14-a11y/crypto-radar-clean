@@ -203,9 +203,13 @@ def gate_historical_context(pair, now):
                 continue
             ts = int(float(row[0]))
             close = fnum(row[2])
+            high = fnum(row[3])
+            low = fnum(row[4])
             quote_vol = fnum(row[1])
             if ts > 0 and close > 0:
-                parsed.append((ts, close, quote_vol))
+                hi = max(close, high) if high > 0 else close
+                lo = min(close, low) if low > 0 else close
+                parsed.append((ts, close, quote_vol, hi, lo))
         parsed.sort(key=lambda x: x[0])
         if not parsed:
             return {}
@@ -215,7 +219,13 @@ def gate_historical_context(pair, now):
             eligible = [x for x in parsed if x[0] <= now-sec]
             if eligible:
                 x = eligible[-1]
-                out[label] = {"price": x[1], "return_pct": pct(current, x[1]), "hour_quote_volume": x[2], "source": "gate_1h"}
+                window = [r for r in parsed if r[0] >= now-sec]
+                high = max((r[3] for r in window), default=current)
+                low = min((r[4] for r in window), default=current)
+                out[label] = {"price": x[1], "return_pct": pct(current, x[1]),
+                              "hour_quote_volume": x[2], "source": "gate_1h",
+                              "high": high, "low": low,
+                              "range_pct": ((high-low)/low*100) if low > 0 else 0.0}
         return out
     except Exception as exc:
         print(f"PEPITO CONTEXTE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
@@ -234,12 +244,16 @@ def persistent_context(pair, now):
             if eligible:
                 r=eligible[-1]
                 out[label]={"price":r[1],"return_pct":pct(rows[-1][1],r[1]),"qv24":r[2],"source":"pepito_sqlite"}
-    # Fill missing horizons without storing 2203 markets continuously.
-    if len(out) < 3:
-        gate = gate_historical_context(pair, now)
-        for label in ("6h","24h","7d"):
-            if label not in out and label in gate:
+    # Gate hourly candles add observable high/low volatility, even if SQLite
+    # already supplies the return. Only queried for AI finalists.
+    gate = gate_historical_context(pair, now)
+    for label in ("6h","24h","7d"):
+        if label in gate:
+            if label not in out:
                 out[label] = gate[label]
+            else:
+                out[label].update({k: gate[label][k] for k in ("high","low","range_pct")
+                                   if k in gate[label]})
     return out
 
 def load_positions():
@@ -901,7 +915,8 @@ def ai_review_batch(candidates):
         "Analyse deux profils: MOMENTUM (30 min-6 heures) et SWING_ACCUMULATION (1-7 jours). "
         "Un SWING_ACCUMULATION peut accumuler des volumes anormaux alors que les retours 5m/15m "
         "sont encore faibles: ne le rejette pas pour cette seule raison. "
-        "Pour SWING_ACCUMULATION, lis les données d'horizon 6h/24h/7j dans persistent_context "
+        "Pour SWING_ACCUMULATION, lis les prix hauts/bas et amplitudes des horizons "
+        "6h/24h/7j dans persistent_context et refuse les objectifs incompatibles. "
         "et exige un potentiel de continuation justifié par les données fournies. "
         "Si les horizons manquent, réponds WAIT. N'invente jamais un breakout, un support ou un objectif. "
         "Les candidats ont DEJA passé une validation quantitative de trajectoire. "
