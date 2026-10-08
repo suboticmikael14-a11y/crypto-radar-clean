@@ -73,6 +73,8 @@ cdc_pairs = set()
 cdc_pairs_updated_at = 0.0
 positions = {}
 gate_rejections = Counter()
+position_last_action = {}
+POSITION_ALERT_COOLDOWN_SEC = int(os.getenv("POSITION_ALERT_COOLDOWN_SEC", "3600"))
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "pepito.sqlite3")
 _state_db = None
@@ -1084,6 +1086,28 @@ def run():
                 action = position_action(held_pair, held_price)
                 if action:
                     print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
+                    # Notify only a new action or a still-active action after cooldown.
+                    # Do not silently send position instructions to an unconfigured channel.
+                    previous = position_last_action.get(held_pair)
+                    if previous is None or previous[0] != action or now - previous[1] >= POSITION_ALERT_COOLDOWN_SEC:
+                        p = positions[held_pair]
+                        entry = fnum(p.get("entry_price"))
+                        pnl = pct(held_price, entry) if entry > 0 else None
+                        pnl_text = f"{pnl:+.2f}% brut depuis entrée" if pnl is not None else "entrée inconnue"
+                        msg = (
+                            f"PEPITO POSITION — {action}\n"
+                            f"{held_pair} | prix Gate {held_price:.10g} | {pnl_text}\n"
+                            f"Entrée {entry:.10g} | invalidation {fnum(p.get('invalidation')):.10g} | "
+                            f"TP1 {fnum(p.get('tp1')):.10g} | TP2 {fnum(p.get('tp2')):.10g}\n"
+                            "Action indicative; vérifier le prix exécutable et les frais sur Crypto.com Exchange."
+                        )
+                        if cdc_tradeable(held_pair) and send_slack_once(msg):
+                            position_last_action[held_pair] = (action, time.time())
+                            print(f"POSITION SLACK SENT — {held_pair} | {action}", flush=True)
+                        else:
+                            print(f"POSITION SLACK NON ENVOYE — {held_pair} | {action}", flush=True)
+                else:
+                    position_last_action.pop(held_pair, None)
 
             raw_signals = []
             signal_by_pair = {}
@@ -1298,8 +1322,10 @@ def pepito_selftest():
         assert position_action("SELF_USDT",0.89) == "SORTIR"
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
+        assert position_action("SELF_USDT",1.05) is None
+        assert position_action("SELF_USDT",1.09) == "NE PLUS RENFORCER"
 
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS | POSITION_ACTIONS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
