@@ -5,7 +5,7 @@ import statistics
 import math
 import json
 import sqlite3
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -72,6 +72,7 @@ ai_next_review_at = {}
 cdc_pairs = set()
 cdc_pairs_updated_at = 0.0
 positions = {}
+gate_rejections = Counter()
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "pepito.sqlite3")
 _state_db = None
@@ -712,6 +713,8 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             ("sightings", pilot.sightings >= 2),
         ) if not ok
     ]
+    # Aggregate rejection reasons each cycle, not just verbose per-token logs.
+    gate_rejections.update(failed_gates)
     print(
         f"PILOTE SUIVI — {sig.pair} | age={age_min:.0f}m | vues={pilot.sightings} | "
         f"score={sig.score} | gain={price_gain:+.2f}% | vol=x{sig.vol_ratio:.1f} | "
@@ -1108,6 +1111,7 @@ def run():
                 if sig:
                     tracked_signals.append(sig)
 
+            gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
                 if sig.pair in positions:
@@ -1199,6 +1203,10 @@ def run():
                     flush=True,
                 )
 
+            if gate_rejections:
+                print("PEPITO REJETS — " + " | ".join(
+                    f"{name}={count}" for name, count in gate_rejections.most_common()
+                ), flush=True)
             print(
                 f"PEPITO JOURNAL — SCANNED {len(tickers)} -> EARLY {early_count} -> "
                 f"TRACKED {len(pilots)} (REEVAL {len(tracked_signals)}) -> CONFIRMED {len(confirmed)} -> "
@@ -1279,13 +1287,19 @@ def pepito_selftest():
             f"Valid early acceleration cannot confirm: {early.score if early else 'filtered'}"
         )
 
-        # 6) Position circuit: stop, TP1 and TP2 actions remain deterministic.
+        # 6) Rejection diagnostics must preserve counts per gate.
+        gate_rejections.clear()
+        gate_rejections.update(["score", "volume", "score"])
+        assert gate_rejections["score"] == 2 and gate_rejections["volume"] == 1
+        gate_rejections.clear()
+
+        # 7) Position circuit: stop, TP1 and TP2 actions remain deterministic.
         positions = {"SELF_USDT":{"entry_price":1.0,"invalidation":0.90,"tp1":1.10,"tp2":1.20}}
         assert position_action("SELF_USDT",0.89) == "SORTIR"
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
