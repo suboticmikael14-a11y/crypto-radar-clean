@@ -16,7 +16,7 @@ GATE_CANDLES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 CDC_INSTRUMENTS_URL = "https://api.crypto.com/exchange/v1/public/get-instruments"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "250000"))
+MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "200000"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -48,6 +48,14 @@ MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "0.75"))
 MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "3.00"))
 MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+# Swing candidates are silent until validated by the same net-gain and CDC gates.
+SWING_ENABLED = os.getenv("SWING_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
+SWING_MIN_AGE_MIN = float(os.getenv("SWING_MIN_AGE_MIN", "8"))
+SWING_MIN_QUOTE_VOL = float(os.getenv("SWING_MIN_QUOTE_VOL", "200000"))
+SWING_MAX_SPREAD = float(os.getenv("SWING_MAX_SPREAD", "0.15"))
+SWING_MIN_RECENT_SPIKES = int(os.getenv("SWING_MIN_RECENT_SPIKES", "3"))
+SWING_MIN_SPIKE_RATIO = float(os.getenv("SWING_MIN_SPIKE_RATIO", "8"))
+
 
 
 # V2 — suivi de trajectoire après la première détection pilote.
@@ -194,9 +202,13 @@ def gate_historical_context(pair, now):
                 continue
             ts = int(float(row[0]))
             close = fnum(row[2])
+            high = fnum(row[3])
+            low = fnum(row[4])
             quote_vol = fnum(row[1])
             if ts > 0 and close > 0:
-                parsed.append((ts, close, quote_vol))
+                hi = max(close, high) if high > 0 else close
+                lo = min(close, low) if low > 0 else close
+                parsed.append((ts, close, quote_vol, hi, lo))
         parsed.sort(key=lambda x: x[0])
         if not parsed:
             return {}
@@ -206,7 +218,13 @@ def gate_historical_context(pair, now):
             eligible = [x for x in parsed if x[0] <= now-sec]
             if eligible:
                 x = eligible[-1]
-                out[label] = {"price": x[1], "return_pct": pct(current, x[1]), "hour_quote_volume": x[2], "source": "gate_1h"}
+                window = [r for r in parsed if r[0] >= now-sec]
+                high = max((r[3] for r in window), default=current)
+                low = min((r[4] for r in window), default=current)
+                out[label] = {"price": x[1], "return_pct": pct(current, x[1]),
+                              "hour_quote_volume": x[2], "source": "gate_1h",
+                              "high": high, "low": low,
+                              "range_pct": ((high-low)/low*100) if low > 0 else 0.0}
         return out
     except Exception as exc:
         print(f"PEPITO CONTEXTE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
@@ -225,12 +243,16 @@ def persistent_context(pair, now):
             if eligible:
                 r=eligible[-1]
                 out[label]={"price":r[1],"return_pct":pct(rows[-1][1],r[1]),"qv24":r[2],"source":"pepito_sqlite"}
-    # Fill missing horizons without storing 2203 markets continuously.
-    if len(out) < 3:
-        gate = gate_historical_context(pair, now)
-        for label in ("6h","24h","7d"):
-            if label not in out and label in gate:
+    # Gate hourly candles add observable high/low volatility, even if SQLite
+    # already supplies the return. Only queried for AI finalists.
+    gate = gate_historical_context(pair, now)
+    for label in ("6h","24h","7d"):
+        if label in gate:
+            if label not in out:
                 out[label] = gate[label]
+            else:
+                out[label].update({k: gate[label][k] for k in ("high","low","range_pct")
+                                   if k in gate[label]})
     return out
 
 def load_positions():
@@ -325,6 +347,7 @@ class ConfirmedCandidate:
     pilot: PilotState
     price_gain: float
     age_min: float
+    style: str = "MOMENTUM"
 
 
 @dataclass
@@ -618,6 +641,26 @@ def open_pilot(sig: Signal, now: float) -> bool:
     return True
 
 
+def swing_accumulation_ok(sig: Signal, pilot: PilotState, age_min: float, price_gain: float) -> bool:
+    """Repeated volume anomaly with stable price: an AI candidate, not a trade."""
+    if not SWING_ENABLED or pilot.sightings < 8 or age_min < SWING_MIN_AGE_MIN:
+        return False
+    if sig.qv24 < SWING_MIN_QUOTE_VOL or sig.spread_pct > SWING_MAX_SPREAD:
+        return False
+    if not (pilot.best_vol_ratio >= 12 and -0.25 <= price_gain <= 2.5):
+        return False
+    if not (-3 <= sig.change_24h <= 10 and pilot.first_change_24h <= 10):
+        return False
+    if not (-0.75 <= sig.ret_5m <= 1.5 and -1.3 <= sig.ret_15m <= 3):
+        return False
+    if sig.price < pilot.first_price * 0.9975:
+        return False
+    recent = list(pilot.trajectory or [])[-12:]
+    spikes = sum(1 for x in recent if len(x) > 8 and x[3] >= SWING_MIN_SPIKE_RATIO
+                 and x[8] <= SWING_MAX_SPREAD)
+    return spikes >= SWING_MIN_RECENT_SPIKES
+
+
 def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]:
     if not can_alert(sig.pair, now):
         return None
@@ -715,6 +758,13 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             age_min=age_min,
         )
 
+    if swing_accumulation_ok(sig, pilot, age_min, price_gain):
+        print(f"SWING ACCUMULATION CANDIDATE — {sig.pair} | age={age_min:.0f}m | "
+              f"vol=x{sig.vol_ratio:.1f} | r5={sig.ret_5m:+.2f}% | "
+              f"cdc/ia/net-profit still required", flush=True)
+        return ConfirmedCandidate(signal=sig, pilot=pilot, price_gain=price_gain,
+                                  age_min=age_min, style="SWING_ACCUMULATION")
+
     failed_gates = [
         name for name, ok in (
             ("score", score_ok), ("age", age_ok), ("price", price_ok),
@@ -785,6 +835,8 @@ def _candidate_payload(c: ConfirmedCandidate):
     p = c.pilot
     return {
         "pair": s.pair,
+        "setup_style": c.style,
+        "time_horizon": "1-7 days" if c.style == "SWING_ACCUMULATION" else "30m-6h",
         "score": s.score,
         "price": s.price,
         "pilot_price": p.first_price,
@@ -858,7 +910,14 @@ def ai_review_batch(candidates):
     }
 
     system_prompt = (
-        "Tu es la couche finale de filtrage d'un radar crypto haussier très court terme. "
+        "Tu es la couche finale de filtrage d'un radar crypto haussier. "
+        "Analyse deux profils: MOMENTUM (30 min-6 heures) et SWING_ACCUMULATION (1-7 jours). "
+        "Un SWING_ACCUMULATION peut accumuler des volumes anormaux alors que les retours 5m/15m "
+        "sont encore faibles: ne le rejette pas pour cette seule raison. "
+        "Pour SWING_ACCUMULATION, lis les prix hauts/bas et amplitudes des horizons "
+        "6h/24h/7j dans persistent_context et refuse les objectifs incompatibles. "
+        "et exige un potentiel de continuation justifié par les données fournies. "
+        "Si les horizons manquent, réponds WAIT. N'invente jamais un breakout, un support ou un objectif. "
         "Les candidats ont DEJA passé une validation quantitative de trajectoire. "
         "Ton rôle n'est pas de forcer un trade: WAIT est le choix par défaut si l'avantage n'est pas net. "
         "Tu dois choisir au maximum UN TRADE dans le lot, celui qui est le plus propre et exploitable maintenant. "
@@ -1004,6 +1063,8 @@ def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     return (
         f"TRADE EXPLOITABLE MAINTENANT — CONFIRMATION/RENFORCEMENT\n"
         f"{s.pair}\n\n"
+        f"Style : {c.style}\n"
+        f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '30m-6h'}\n"
         f"Prix actuel : {s.price:.10g}\n"
         f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
         f"Invalidation : {review.invalidation:.10g}\n"
@@ -1304,6 +1365,27 @@ def pepito_selftest():
         assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
 
 
+        # Regression of a MET-like sideways accumulation with persistent volume.
+        sc = synthetic_signal(pair="MET_USDT", price=1.005, qv24=215000,
+                              spread=0.10, change24=5.0, score=70,
+                              vol=12.0, r1=0.01, r5=0.00, r15=0.30)
+        pi = PilotState(now-12*60, now, 1.0, 60, 25, 0, 0, 0.1, 4.0,
+                        sightings=12, best_score=75, best_vol_ratio=25,
+                        best_price=1.008, min_price=0.999, last_price=1.005,
+                        last_score=70, last_vol_ratio=12,
+                        trajectory=deque([(now-j*60, 1.005,70,12.0,0,0,0.3,215000,0.1,5.0)
+                                          for j in range(12)],maxlen=90))
+        assert swing_accumulation_ok(sc, pi, 12, 0.5)
+        assert not swing_accumulation_ok(sc, pi, 2, 0.5)
+        bad = synthetic_signal(pair="MET_USDT",price=1.005,qv24=215000,
+                               spread=0.35,change24=5.0,score=70,vol=12.0,
+                               r1=0.01,r5=0.0,r15=0.30)
+        assert not swing_accumulation_ok(bad, pi, 12, 0.5)
+        cdc_pairs.add("MET_USD")
+        cc = ConfirmedCandidate(sc,pi,0.5,12,"SWING_ACCUMULATION")
+        assert not validate_trade_review(
+            AIReview("MET_USDT","TRADE",90,"weak",1.004,1.006,0.99,1.015,1.02),cc)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1347,7 +1429,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
