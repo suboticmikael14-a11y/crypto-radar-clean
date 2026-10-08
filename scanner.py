@@ -39,6 +39,16 @@ AI_ERROR_COOLDOWN_MIN = int(os.getenv("AI_ERROR_COOLDOWN_MIN", "3"))
 AI_MAX_SIGNAL_AGE_MIN = int(os.getenv("AI_MAX_SIGNAL_AGE_MIN", "90"))
 AI_MAX_PRICE_GAIN = float(os.getenv("AI_MAX_PRICE_GAIN", "4.0"))
 AI_HTTP_TIMEOUT = int(os.getenv("AI_HTTP_TIMEOUT", "35"))
+# Strict net-exploitability gate. Conservative default for base Crypto.com
+# Exchange spot taker trades (0.50% buy + 0.50% sell), plus execution buffer.
+# The app can charge a different price/fee: never promise an executable profit.
+ROUND_TRIP_FEE_PCT = float(os.getenv("ROUND_TRIP_FEE_PCT", "1.00"))
+EXECUTION_BUFFER_PCT = float(os.getenv("EXECUTION_BUFFER_PCT", "0.30"))
+MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "0.75"))
+MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "3.00"))
+MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
+MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+
 
 # V2 — suivi de trajectoire après la première détection pilote.
 PILOT_TTL_MIN = int(os.getenv("PILOT_TTL_MIN", "180"))
@@ -858,6 +868,10 @@ def ai_review_batch(candidates):
         "progression depuis pilote positive mais pas déjà trop étendue, et âge raisonnable. "
         "Déclasse si le volume retombe fortement, si le mouvement paraît déjà consommé, si le spread/liquidité est faible, "
         "ou si le ratio rendement/risque n'est pas propre. "
+        "Le coût estimé aller-retour est de 1,30% (frais, spread et exécution). "
+        "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 0,75% net, "
+        "TP2 au moins 3,0% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
+        "Ne gonfle JAMAIS les objectifs pour contourner ce filtre: WAIT si les données ne justifient pas un tel potentiel. "
         "Pour TRADE seulement, fournis une zone d'entrée autour du prix actuel, une invalidation sous l'entrée, "
         "et TP1/TP2 au-dessus. Les niveaux doivent être cohérents avec un trade court terme, pas des objectifs fantaisistes. "
         "La raison doit être en français, concrète, en une phrase courte."
@@ -954,13 +968,32 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
     lo, hi, inv, tp1, tp2 = vals
     if lo > hi or not (inv < lo <= hi < tp1 < tp2):
         return False
-    # La zone proposée doit rester proche du marché actuel; sinon l'alerte est déjà périmée.
-    if abs(pct(c.signal.price, (lo + hi) / 2.0)) > 3.0:
+    # Reject stale or out-of-market AI entry zones.
+    if abs(pct(c.signal.price, (lo + hi) / 2.0)) > MAX_ENTRY_DRIFT_PCT:
         return False
-    risk = ((lo + hi) / 2.0) - inv
-    reward1 = tp1 - ((lo + hi) / 2.0)
-    if risk <= 0 or reward1 / risk < 1.0:
+
+    # Check worst executable entry within the proposed zone (hi), not midpoint.
+    # Use a conservative round-trip cost reserve; actual app quotes may be worse.
+    costs_pct = max(0.0, ROUND_TRIP_FEE_PCT) + max(0.0, EXECUTION_BUFFER_PCT)
+    gross_tp1_pct = (tp1 / hi - 1.0) * 100.0
+    gross_tp2_pct = (tp2 / hi - 1.0) * 100.0
+    net_tp1_pct = gross_tp1_pct - costs_pct
+    net_tp2_pct = gross_tp2_pct - costs_pct
+    loss_including_costs_pct = (hi - inv) / hi * 100.0 + costs_pct
+    net_rr = net_tp2_pct / loss_including_costs_pct if loss_including_costs_pct > 0 else 0.0
+
+    if (net_tp1_pct < MIN_NET_TP1_PCT
+            or net_tp2_pct < MIN_NET_TP2_PCT
+            or net_rr < MIN_NET_REWARD_RISK):
+        print(
+            f"TRADE BLOQUE RENTABILITE — {c.signal.pair} | "
+            f"TP1_net={net_tp1_pct:+.2f}% | TP2_net={net_tp2_pct:+.2f}% | "
+            f"risque_frais={loss_including_costs_pct:.2f}% | "
+            f"RR_net={net_rr:.2f} | reserve_frais={costs_pct:.2f}%",
+            flush=True,
+        )
         return False
+
     if c.age_min > AI_MAX_SIGNAL_AGE_MIN or c.price_gain > AI_MAX_PRICE_GAIN:
         return False
     return True
@@ -1234,8 +1267,8 @@ def pepito_selftest():
                          change24=1.0, score=92, vol=20.0, r1=0.15, r5=0.50, r15=0.80):
         return Signal(pair, price, r1, r5, r15, vol, qv24, spread, change24, score, "ENTREE PILOTE")
 
-    def candidate(pair):
-        sig = synthetic_signal(pair=pair)
+    def candidate(pair, price=1.01):
+        sig = synthetic_signal(pair=pair, price=price)
         pilot = PilotState(now-600, now, 1.0, 80, 3.2, 0.05, 0.10, 0.15, 0.0,
                            sightings=4, best_score=92, best_vol_ratio=20.0,
                            best_price=1.01, min_price=1.0, last_price=1.01,
@@ -1244,17 +1277,32 @@ def pepito_selftest():
         return ConfirmedCandidate(sig, pilot, 1.0, 10.0)
 
     def review(pair):
-        return AIReview(pair, "TRADE", 90, "fixture", 0.99, 1.01, 0.97, 1.05, 1.10)
+        return AIReview(pair, "TRADE", 90, "fixture", 1.00, 1.02, 0.98, 1.07, 1.15)
 
     try:
         # 1) Real-exchange gate regression: NIGHT/XPL pass fixture; KAS/SHX never TRADE.
-        cdc_pairs = {"NIGHT_USD", "XPL_USD"}
+        cdc_pairs = {"NIGHT_USD", "XPL_USD", "AKT_USD", "OP_USD", "ENA_USD"}
         assert cdc_tradeable("NIGHT_USDT") and cdc_tradeable("XPL_USDT")
         assert not cdc_tradeable("KAS_USDT") and not cdc_tradeable("SHX_USDT")
         assert not cdc_tradeable("USDT_USDT")
         assert validate_trade_review(review("NIGHT_USDT"), candidate("NIGHT_USDT"))
         assert not validate_trade_review(review("KAS_USDT"), candidate("KAS_USDT"))
         assert not validate_trade_review(review("SHX_USDT"), candidate("SHX_USDT"))
+        # Net-profit regression: these October 8 alerts have inadequate potential
+        # after fee reserve even if momentum and AI confidence look strong.
+        weak_setups = [
+            ("AKT_USDT", 0.7268, 0.7255, 0.7275, 0.7215, 0.7315, 0.7355),
+            ("OP_USDT", 0.12221, 0.1221, 0.1223, 0.12175, 0.12275, 0.1231),
+            ("ENA_USDT", 0.22213, 0.2218, 0.2222, 0.2208, 0.2235, 0.225),
+        ]
+        for pair, price, lo, hi, inv, tp1, tp2 in weak_setups:
+            weak = AIReview(pair, "TRADE", 96, "momentum", lo, hi, inv, tp1, tp2)
+            assert not validate_trade_review(weak, candidate(pair, price)), pair
+
+        # Never accept far-from-market order zones even with ambitious objectives.
+        stale = AIReview("NIGHT_USDT", "TRADE", 99, "stale", 1.05, 1.06, 1.02, 1.12, 1.25)
+        assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
+
 
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
@@ -1299,7 +1347,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | CDC_BLOCK | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
