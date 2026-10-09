@@ -913,8 +913,16 @@ def continuation_ok(sig, pilot, age_min, price_gain):
         return False
     if not (0.35 <= sig.ret_5m <= 3.0 and 0.55 <= sig.ret_15m <= 6.0):
         return False
-    if sig.spread_pct > 0.20 or sig.change_24h > 22.0:
+    if sig.spread_pct > 0.20:
         return False
+    # A market already extended over 24h only qualifies for a NEW leg after
+    # multiple observations, at least eight minutes, and moderate 5m/15m moves.
+    if max(sig.change_24h, pilot.first_change_24h) > 20.0:
+        if (pilot.sightings < 8 or age_min < 8.0
+                or sig.vol_ratio < 1.2
+                or sig.ret_5m > 1.6 or sig.ret_15m > 3.5
+                or price_gain > 5.0):
+            return False
     return True
 
 
