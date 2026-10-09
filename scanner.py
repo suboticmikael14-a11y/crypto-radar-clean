@@ -1238,9 +1238,15 @@ def ai_review_batch(candidates):
         "Déclasse si le volume retombe fortement, si le mouvement paraît déjà consommé, si le spread/liquidité est faible, "
         "ou si le ratio rendement/risque n'est pas propre. "
         "Le coût estimé aller-retour est de 1,30% (frais, spread et exécution). "
+        "Le stop doit être assez large pour la volatilité réelle: minimum 0,55% en MOMENTUM, "
+        "0,80% en CONTINUATION et 1,35% en SWING_ACCUMULATION, "
+        "et au moins 2,25 fois la volatilité médiane des bougies 1m fournie. "
+        "Ne raccourcis jamais le stop artificiellement pour améliorer le ratio rendement/risque. "
         "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 2% net, "
         "TP2 au moins 6% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
         "Ne gonfle JAMAIS les objectifs pour contourner ce filtre: WAIT si les données ne justifient pas un tel potentiel. "
+        "Sans place réaliste vers des niveaux hauts cohérents 6h/24h/7j, réponds WAIT, "
+        "même pour une crypto à fort volume. Le prix doit encore être dans la zone au moment de l'alerte. "
         "Pour TRADE seulement, fournis une zone d'entrée autour du prix actuel, une invalidation sous l'entrée, "
         "et TP1/TP2 au-dessus. Les niveaux doivent être cohérents avec un trade court terme, pas des objectifs fantaisistes. "
         "La raison doit être en français, concrète, en une phrase courte."
@@ -1759,6 +1765,28 @@ def pepito_selftest():
             weak = AIReview(pair, "TRADE", 96, "momentum", lo, hi, inv, tp1, tp2)
             assert not validate_trade_review(weak, candidate(pair, price)), pair
 
+        # V7: previously sent ADA/QNT messages must NOT qualify as valuable trades.
+        assert MIN_NET_TP1_PCT >= 2.0 and MIN_NET_TP2_PCT >= 6.0
+        for pair,px,lo,hi,inv,tp1,tp2 in [
+            ("ADA_USDT",0.24223,0.2418,0.2423,0.2408,0.2473,0.2548),
+            ("ADA_USDT",0.23886,0.2386,0.2390,0.2382,0.2441,0.2502),
+            ("QNT_USDT",250.619,250.4,250.7,249.8,256.2,264.0),
+        ]:
+            cdc_pairs.add(pair.replace("_USDT","_USD"))
+            weak=AIReview(pair,"TRADE",99,"previous real Slack",lo,hi,inv,tp1,tp2)
+            assert not validate_trade_review(weak,candidate(pair,px)),pair
+        # A high target cannot make a sub-noise stop acceptable.
+        too_tight=AIReview("NIGHT_USDT","TRADE",98,"unrealistic stop",
+                           1.019,1.020,1.017,1.080,1.190)
+        assert not validate_trade_review(too_tight,candidate("NIGHT_USDT",1.0195))
+        assert validate_trade_review(review("NIGHT_USDT"),candidate("NIGHT_USDT"))
+        info=format_trade_alert(candidate("NIGHT_USDT"),review("NIGHT_USDT"))
+        assert "Potentiel net estimé" in info and "3 minutes maximum" in info
+        last_alert_at["ADA_USDT"]=now-12*3600
+        assert not can_alert("ADA_USDT",now)
+        assert can_alert("ADA_USDT",now+12*3600)
+        last_alert_at.pop("ADA_USDT",None)
+
         # Never accept far-from-market order zones even with ambitious objectives.
         stale = AIReview("NIGHT_USDT", "TRADE", 99, "stale", 1.05, 1.06, 1.02, 1.12, 1.25)
         assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
@@ -1922,7 +1950,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
