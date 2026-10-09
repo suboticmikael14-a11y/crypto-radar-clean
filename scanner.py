@@ -1367,6 +1367,16 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
     if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
         return deny("net_profit_or_reward_risk",detail)
+    # Start with a style-dependent minimum stop; live data will increase the
+    # required distance when true range is wider than ordinary conditions.
+    min_stop = (
+        MIN_STOP_SWING_PCT if c.style=="SWING_ACCUMULATION" else
+        MIN_STOP_CONTINUATION_PCT if c.style=="CONTINUATION" else
+        MIN_STOP_MOMENTUM_PCT
+    )
+    stop_distance_pct = (hi-inv)/hi*100.0
+    if stop_distance_pct < min_stop:
+        return deny("stop_too_tight",f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% style={c.style}")
     if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style=="MOMENTUM":
         return deny("stale_momentum",f"age={c.age_min:.0f}m")
     cap = (12.0 if c.style=="CONTINUATION" else
@@ -1381,6 +1391,14 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         m = cdc_candle_metrics(pair)
         if not m or m["age_sec"]>CANDLE_MIN_FRESH_SEC:
             return deny("stale_exchange_candles")
+        atr_pct = fnum(m.get("atr_1m_pct"),0)
+        if atr_pct <= 0:
+            return deny("missing_volatility_evidence")
+        min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
+        if stop_distance_pct < min_stop:
+            return deny("stop_under_normal_volatility",
+                        f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% "
+                        f"atr_1m={atr_pct:.3f}%")
         if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
             return deny("insufficient_real_exchange_volume",
                         f"1m_usd={m['volume_1m_usd_est']:.0f} x={m['volume_ratio']:.1f}")
@@ -1401,8 +1419,15 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             if not live:
                 return deny("no_fresh_executable_quote")
             ask = fnum(live[0].get("lowest_ask"))
-            if ask<=0 or not (lo*0.9985<=ask<=hi*1.001):
+            bid = fnum(live[0].get("highest_bid"))
+            if ask<=0 or not (lo<=ask<=hi):
                 return deny("ask_outside_buy_zone",f"ask={ask:.10g} entry={lo:.10g}:{hi:.10g}")
+            if bid<=0 or 100.0*(ask-bid)/((ask+bid)/2) > CONFIRM_MAX_SPREAD:
+                return deny("live_spread_too_wide")
+            live_stop = 100.0*(ask-inv)/ask
+            if live_stop < min_stop:
+                return deny("stop_too_tight_at_live_ask",
+                            f"stop={live_stop:.2f}% min={min_stop:.2f}%")
         except Exception as exc:
             return deny("exchange_requote_error",f"exception={type(exc).__name__}")
     return True
