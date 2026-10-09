@@ -201,44 +201,56 @@ def commit_state(now):
         _state_db.commit()
 
 def gate_historical_context(pair, now):
-    """Compact 6h/24h/7d context from Gate hourly candles; fetched only for candidates."""
+    """6h/24h/7d spot context from the actual Crypto.com Exchange instrument.
+    Gate is supplementary for early detection, never the source of executable prices.
+    """
+    market = cdc_ticker_by_pair.get(pair)
+    if not market or not market.get("exchange_symbol"):
+        return {}
     try:
-        r = session.get(GATE_CANDLES_URL, params={"currency_pair": pair, "interval": "1h", "limit": 168}, timeout=HTTP_TIMEOUT)
+        r = session.get(CDC_CANDLES_URL, params={
+            "instrument_name": market["exchange_symbol"], "timeframe": "1h",
+            "count": 170
+        }, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        candles = r.json()
-        parsed = []
-        for row in candles if isinstance(candles, list) else []:
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            ts = int(float(row[0]))
-            close = fnum(row[2])
-            high = fnum(row[3])
-            low = fnum(row[4])
-            quote_vol = fnum(row[1])
-            if ts > 0 and close > 0:
-                hi = max(close, high) if high > 0 else close
-                lo = min(close, low) if low > 0 else close
-                parsed.append((ts, close, quote_vol, hi, lo))
-        parsed.sort(key=lambda x: x[0])
-        if not parsed:
+        payload = r.json()
+        if payload.get("code") != 0:
             return {}
-        current = parsed[-1][1]
+        rows = sorted(payload.get("result", {}).get("data", []),
+                      key=lambda x: fnum(x.get("t")))
+        parsed = []
+        for c in rows:
+            ts = fnum(c.get("t")) / 1000.0
+            close = fnum(c.get("c"))
+            high = fnum(c.get("h"))
+            low = fnum(c.get("l"))
+            vol = fnum(c.get("v"))
+            if ts > 0 and close > 0 and high > 0 and low > 0 and ts <= now:
+                parsed.append((ts, close, vol*close, high, low))
+        if len(parsed) < 2:
+            return {}
+        current = fnum(market.get("last")) or parsed[-1][1]
         out = {}
-        for label, sec in (("6h",21600),("24h",86400),("7d",604800)):
-            eligible = [x for x in parsed if x[0] <= now-sec]
-            if eligible:
-                x = eligible[-1]
-                window = [r for r in parsed if r[0] >= now-sec]
-                high = max((r[3] for r in window), default=current)
-                low = min((r[4] for r in window), default=current)
-                out[label] = {"price": x[1], "return_pct": pct(current, x[1]),
-                              "hour_quote_volume": x[2], "source": "gate_1h",
-                              "high": high, "low": low,
-                              "range_pct": ((high-low)/low*100) if low > 0 else 0.0}
+        for label, sec in (("6h", 21600), ("24h", 86400), ("7d", 604800)):
+            window = [x for x in parsed if x[0] >= now-sec]
+            old = [x for x in parsed if x[0] <= now-sec]
+            if len(window) < 2:
+                continue
+            hi = max(x[3] for x in window)
+            lo = min(x[4] for x in window)
+            comparison = old[-1][1] if old else window[0][1]
+            out[label] = {
+                "price": comparison, "return_pct": pct(current, comparison),
+                "hour_quote_volume": window[-1][2],
+                "source": "crypto_com_exchange_spot_1h",
+                "high": hi, "low": lo,
+                "range_pct": (hi/lo-1)*100 if lo>0 else 0
+            }
         return out
     except Exception as exc:
-        print(f"PEPITO CONTEXTE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
+        print(f"V4 CONTEXTE CDC INDISPONIBLE — {pair} | {type(exc).__name__}: {exc}", flush=True)
         return {}
+
 
 def persistent_context(pair, now):
     if _state_db is not None:
@@ -677,7 +689,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     score = min(100, round(100 * (volume_pts + flow_pts + liquidity_pts + unextended_pts + structure_pts) / 90))
 
     # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
-    if not tracking and (change24h > 20.0 or ret15 > 9.0):
+    if not tracking and (change24h >= 20.0 or ret15 > 9.0):
         return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
@@ -1362,9 +1374,7 @@ def run():
             early_count = len(raw_signals)
             # Enrich only a budgeted subset with actual 1-minute traded volume.
             # Run the enrichment before trajectory confirmations and AI.
-            to_enrich = raw_signals[:CANDLE_ENRICH_PER_SCAN//2] + [
-                x for x in tracked_signals[:0]  # tracked_signals is built below
-            ] if False else raw_signals[:CANDLE_ENRICH_PER_SCAN//2]
+            to_enrich = raw_signals[:CANDLE_ENRICH_PER_SCAN//2]
             for sig in to_enrich:
                 metrics = cdc_candle_metrics(sig.pair, now)
                 if metrics:
