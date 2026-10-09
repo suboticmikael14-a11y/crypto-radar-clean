@@ -713,7 +713,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     samples = history[pair]
     # A new listing can be screened after two ticker observations when recent,
     # REAL closed 1-minute candles already provide the 1/5/15m history.
-    if len(samples) < (2 if metrics else 7):
+    if len(samples) < (1 if metrics else 7):
         return None
 
     cur = samples[-1]
@@ -1729,8 +1729,12 @@ def pepito_selftest():
             "volume_ratio":18.0, "volume_1m_usd_est":2100,
             "r1":0.14,"r5":0.45,"r15":0.65,"age_sec":30
         }
+        # 1m candles already include history even on the scanner's FIRST tick.
         new_sig=score_signal(vp,0.0,metrics=real_candles)
         assert new_sig is not None and new_sig.vol_ratio==18.0
+        history[vp].popleft()
+        first_tick_sig=score_signal(vp,0.0,metrics=real_candles)
+        assert first_tick_sig is not None and first_tick_sig.vol_ratio==18.0
         assert new_sig.ret_5m==0.45
         assert excluded_pair("USDT_USDT") and excluded_pair("USD_USDT")
         pair_list = v5_choose_candle_pairs([{
