@@ -597,10 +597,23 @@ def cdc_candle_metrics(pair, now=None):
             fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
             ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
         closes = [fnum(x["c"]) for x in closed]
+        # Median one-minute true range from CLOSED Exchange spot candles, not
+        # a fixed stop just below the AI-generated entry.
+        true_ranges = []
+        for i in range(max(1, len(closed)-20),len(closed)):
+            prev_close = closes[i-1]
+            high = fnum(closed[i].get("h"))
+            low = fnum(closed[i].get("l"))
+            if prev_close > 0 and high >= low > 0:
+                true_ranges.append(
+                    100.0*max(high-low,abs(high-prev_close),abs(low-prev_close))/prev_close
+                )
+        median_true_range_pct = statistics.median(true_ranges) if true_ranges else 0.0
         # Cap pathological ratios from sparse, thin markets: x50k is not credible.
         ratio = min(80.0, max(0.0, ratio))
         metrics = {
             "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "atr_1m_pct": median_true_range_pct,
             "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
             "volume_1m_usd_est": values[-1], "age_sec": now - fnum(closed[-1]["t"]) / 1000.0 - 60,
