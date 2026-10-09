@@ -1524,7 +1524,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V4 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->TRADE | "
+        f"VALIDATION V7 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1977,7 +1977,14 @@ def pepito_integration_test():
         assert context, f"6h/24h context missing: {asset}"
         checked.append(f"{asset}={item['exchange_symbol']} 1m_vol={candle['volume_1m_usd_est']:.0f} "
                        f"r5={candle['r5']:+.2f}% c6h={context.get('6h',{}).get('return_pct','NA')}")
-    print("PEPITO V4 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
+    # Confirm the added volatility field on active Exchange markets.
+    for pair in ("ADA_USDT","QNT_USDT"):
+        if pair in cdc_ticker_by_pair:
+            data = cdc_candle_metrics(pair)
+            assert data and data.get("atr_1m_pct",0) > 0, f"Missing live ATR for {pair}"
+            print(f"V7 ATR EXCHANGE — {pair} | ATR1m={data['atr_1m_pct']:.3f}% "
+                  f"r5={data['r5']:+.2f}% fresh={data['age_sec']:.0f}s",flush=True)
+    print("PEPITO V7 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
           +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
 
 
