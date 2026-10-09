@@ -120,6 +120,12 @@ def init_state_db():
     _state_db.execute("CREATE INDEX IF NOT EXISTS idx_market_history_ts ON market_history(bucket_ts)")
     _state_db.execute("""CREATE TABLE IF NOT EXISTS pilot_state (
         pair TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)""")
+    _state_db.execute("""CREATE TABLE IF NOT EXISTS sent_trades (
+        pair TEXT PRIMARY KEY, sent_at REAL NOT NULL)""")
+    for pair, sent_at in _state_db.execute(
+        "SELECT pair,sent_at FROM sent_trades WHERE sent_at >= ?", (time.time()-7*86400,)
+    ).fetchall():
+        last_alert_at[pair] = float(sent_at)
     _state_db.execute("DELETE FROM market_history WHERE bucket_ts < ?", (int(time.time()) - 8*24*3600,))
     _state_db.commit()
     _state_db.execute("VACUUM")
@@ -144,7 +150,8 @@ def restore_pilots(now):
     for pair, payload, updated_at in _state_db.execute("SELECT pair,payload,updated_at FROM pilot_state").fetchall():
         try:
             d = json.loads(payload)
-            if now - float(d.get("created_at", 0)) > ttl:
+            if (now - float(d.get("created_at", 0)) > ttl
+                    or last_alert_at.get(pair, 0) >= float(d.get("created_at", 0))):
                 _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
                 continue
             d["trajectory"] = deque(d.get("trajectory") or [], maxlen=90)
@@ -156,6 +163,18 @@ def restore_pilots(now):
     _state_db.commit()
     print(f"PEPITO PILOTES — {restored} restaure(s) depuis SQLite", flush=True)
     return restored
+
+def mark_trade_sent(pair, timestamp):
+    """Persist cooldown and remove completed pilot before a Railway redeploy."""
+    last_alert_at[pair] = timestamp
+    pilots.pop(pair, None)
+    ai_next_review_at.pop(pair, None)
+    if _state_db is not None:
+        _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
+        _state_db.execute("""INSERT INTO sent_trades(pair,sent_at) VALUES (?,?)
+            ON CONFLICT(pair) DO UPDATE SET sent_at=excluded.sent_at""", (pair, timestamp))
+        _state_db.commit()
+
 
 def restore_pilot_history(now):
     """Restore recent snapshots for live pilots so multi-pass tracking survives restarts."""
@@ -1273,7 +1292,7 @@ def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
         f"spread {s.spread_pct:.3f}%\n"
         f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
-        f"Source marché : Gate.io | validation Crypto.com Exchange"
+        f"Source prix/volume : Crypto.com Exchange (Spot) | Gate.io : auxiliaire"
     )
 
 
@@ -1329,7 +1348,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V3 ACTIVE — PILOTE->TRAJECTOIRE->CONFIRME->IA->TRADE | "
+        f"VALIDATION V4 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->TRADE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1495,9 +1514,7 @@ def run():
                             print(message, flush=True)
                             slack_attempted += 1
                             if send_slack_once(message):
-                                last_alert_at[best_pair] = time.time()
-                                pilots.pop(best_pair, None)
-                                ai_next_review_at.pop(best_pair, None)
+                                mark_trade_sent(best_pair, time.time())
                                 sent = 1
                         elif review and candidate:
                             print(
@@ -1601,6 +1618,7 @@ def pepito_selftest():
             AIReview("MET_USDT","TRADE",90,"weak",1.004,1.006,0.99,1.015,1.02),cc)
 
         assert AI_OUTPUT_TOKEN_BUDGET >= 2000
+        assert "mark_trade_sent" in globals()
         # V4: official instrument universe / liquidity / synthetic OGN+RLC coverage.
         mock = {"code":0, "result":{"data":[
             {"i":"OGN_USD","a":"0.027","b":"0.0269","k":"0.0271","vv":"360000","c":"0.16"},
