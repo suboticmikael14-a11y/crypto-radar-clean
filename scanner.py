@@ -1762,6 +1762,30 @@ def pepito_selftest():
         assert set(pair_list)=={"OGN_USDT","RLC_USDT"}, pair_list
         history.pop(vp,None)
 
+        # V6: an extended coin may enter silent surveillance after a new base.
+        hp6="V6HOT_USDT"
+        history[hp6].clear()
+        history[hp6].append(Snapshot(now,1.0,2_000_000,0.9997,1.0003))
+        quiet={"volume_ratio":3.0,"volume_1m_usd_est":1500.0,
+               "r1":0.05,"r5":0.25,"r15":0.72,"age_sec":18}
+        hot_sig=score_signal(hp6,40.0,metrics=quiet)
+        assert hot_sig is not None and hot_sig.change_24h==40.0
+        assert open_pilot(hot_sig,now) and hp6 in pilots
+        hp6_pilot=pilots[hp6]
+        hp6_pilot.sightings=10
+        hp6_pilot.best_score=80
+        hp6_pilot.best_vol_ratio=12.0
+        reaccel=synthetic_signal(pair=hp6,price=1.009,score=69,vol=4.0,
+                                 r1=0.10,r5=0.65,r15=1.1,change24=41.0)
+        assert continuation_ok(reaccel,hp6_pilot,11,0.9)
+        assert not continuation_ok(reaccel,hp6_pilot,3,0.9)
+        assert not continuation_ok(
+            synthetic_signal(pair=hp6,price=1.009,score=69,vol=4,
+                             r1=0.5,r5=3.0,r15=6.0,change24=41),
+            hp6_pilot,12,0.9)
+        pilots.pop(hp6,None)
+        history.pop(hp6,None)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1805,7 +1829,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
