@@ -795,7 +795,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     score = min(100, round(100 * (volume_pts + flow_pts + liquidity_pts + unextended_pts + structure_pts) / 90))
 
     # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
-    if not tracking and (change24h >= 20.0 or ret15 > 9.0):
+    if not tracking and ret15 > 9.0:
         return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
