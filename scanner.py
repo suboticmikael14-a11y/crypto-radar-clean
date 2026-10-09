@@ -6,6 +6,7 @@ import math
 import json
 import sqlite3
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -78,7 +79,7 @@ HISTORY_MAX_MIN = int(os.getenv("HISTORY_MAX_MIN", "450"))
 
 EXCLUDED_BASES = {
     "USDC", "USDE", "USDS", "FDUSD", "TUSD", "DAI", "PYUSD", "USD1",
-    "EUR", "EURC", "EURI", "USDP", "GUSD", "BUSD"
+    "EUR", "EURC", "EURI", "USDP", "GUSD", "BUSD", "USDT", "USD", "USDD", "USDDC"
 }
 
 session = requests.Session()
@@ -95,7 +96,13 @@ cdc_market_by_base = {}
 cdc_ticker_by_pair = {}
 gate_aux_history = defaultdict(lambda: deque(maxlen=50))
 candle_cache = {}
-CANDLE_ENRICH_PER_SCAN = int(os.getenv("CANDLE_ENRICH_PER_SCAN", "18"))
+CANDLE_ROTATION_PER_SCAN = int(os.getenv("CANDLE_ROTATION_PER_SCAN", "85"))
+CANDLE_FOCUS_PER_SCAN = int(os.getenv("CANDLE_FOCUS_PER_SCAN", "20"))
+CANDLE_TRACKED_PER_SCAN = int(os.getenv("CANDLE_TRACKED_PER_SCAN", "28"))
+CANDLE_WORKERS = min(6, max(1, int(os.getenv("CANDLE_WORKERS", "6"))))
+_candle_cursor = 0
+_track_cursor = 0
+v5_diagnostics = Counter()
 CANDLE_MIN_FRESH_SEC = int(os.getenv("CANDLE_MIN_FRESH_SEC", "140"))
 V4_BACKTEST_MODE = os.getenv("PEPITO_SELFTEST", "0").lower() in {"1","true","yes","on"}
 
@@ -585,8 +592,11 @@ def cdc_candle_metrics(pair, now=None):
             fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
             ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
         closes = [fnum(x["c"]) for x in closed]
+        # Cap pathological ratios from sparse, thin markets: x50k is not credible.
+        ratio = min(80.0, max(0.0, ratio))
         metrics = {
-            "volume_ratio": ratio, "r5": pct(closes[-1], closes[-6]),
+            "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
             "volume_1m_usd_est": values[-1], "age_sec": now - fnum(closed[-1]["t"]) / 1000.0 - 60,
             "high_45m": max(fnum(x.get("h")) for x in closed[-40:]),
@@ -610,6 +620,57 @@ def gate_volume_ratio(pair):
     baseline = statistics.median(deltas[:-1][-20:])
     latest = max(0.0, samples[-1].qv24 - samples[-2].qv24)
     return latest / baseline if baseline > 0 else 0.0
+
+
+def v5_choose_candle_pairs(tickers):
+    """Rotating market coverage + priority watchlist. Never wait for a 24h delta to
+    decide whether a market deserves its first real 1m-volume inspection.
+    """
+    global _candle_cursor, _track_cursor
+    available = {t["currency_pair"]: t for t in tickers
+                 if not excluded_pair(t["currency_pair"])}
+    universe = sorted(available)
+    if not universe:
+        return []
+    start = _candle_cursor % len(universe)
+    rotation = [universe[(start+i) % len(universe)]
+                for i in range(min(CANDLE_ROTATION_PER_SCAN, len(universe)))]
+    _candle_cursor = (start + len(rotation)) % len(universe)
+    # Focus on fresh 5m price impulses, then 24h changes that have not already
+    # run too far. A quote remains non-tradable until full risk/fee checks pass.
+    def priority(pair):
+        t = available[pair]
+        samples = history.get(pair) or []
+        prev = closest_before(samples, 4*60+30) if samples else None
+        move5 = pct(samples[-1].price, prev.price) if prev else 0.0
+        day = fnum(t.get("change_percentage"))
+        return (max(0, move5)*4 + (min(16, max(0, day))*0.13)
+                + min(3, max(0, math.log10(max(1, fnum(t.get("quote_volume")))) - 5)))
+    focus = sorted(universe, key=priority, reverse=True)[:CANDLE_FOCUS_PER_SCAN]
+    watching = sorted((p for p in pilots if p in available),
+                      key=lambda p: (-pilots[p].best_score, p))
+    tracked = []
+    if watching:
+        ts = _track_cursor % len(watching)
+        tracked = [watching[(ts+i) % len(watching)]
+                   for i in range(min(CANDLE_TRACKED_PER_SCAN, len(watching)))]
+        _track_cursor = (ts+len(tracked)) % len(watching)
+    return list(dict.fromkeys(focus + tracked + rotation))
+
+
+def v5_load_candles(pairs, now):
+    """Concurrently fetch read-only Exchange 1m candles with a strict worker cap."""
+    out = {}
+    if not pairs:
+        return out
+    def one(pair):
+        m = cdc_candle_metrics(pair, now)
+        return pair, m
+    with ThreadPoolExecutor(max_workers=CANDLE_WORKERS) as executor:
+        for pair, data in executor.map(one, pairs):
+            if data and data.get("age_sec", 9999) <= CANDLE_MIN_FRESH_SEC:
+                out[pair] = data
+    return out
 
 
 def add_snapshot(ticker, now):
@@ -647,21 +708,24 @@ def minute_volume_deltas(samples):
     return out
 
 
-def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False) -> Optional[Signal]:
+def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False,
+                 metrics=None) -> Optional[Signal]:
     samples = history[pair]
-    if len(samples) < 7:
+    # A new listing can be screened after two ticker observations when recent,
+    # REAL closed 1-minute candles already provide the 1/5/15m history.
+    if len(samples) < (2 if metrics else 7):
         return None
 
     cur = samples[-1]
     s1 = closest_before(samples, 55)
     s5 = closest_before(samples, 4 * 60 + 30)
     s15 = closest_before(samples, 14 * 60 + 30)
-    if not s1 or not s5:
+    if not metrics and (not s1 or not s5):
         return None
 
-    ret1 = pct(cur.price, s1.price)
-    ret5 = pct(cur.price, s5.price)
-    ret15 = pct(cur.price, s15.price) if s15 else 0.0
+    ret1 = metrics["r1"] if metrics else pct(cur.price, s1.price)
+    ret5 = metrics["r5"] if metrics else pct(cur.price, s5.price)
+    ret15 = metrics["r15"] if metrics else (pct(cur.price, s15.price) if s15 else 0.0)
     # 24h est enrichi depuis le ticker Gate après scoring; pour le scoring lui-même,
     # on le calcule depuis l’historique local quand 24h est disponible, sinon 0.
     s24 = closest_before(samples, 24 * 60 * 60 - 30)
@@ -675,23 +739,39 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     if cur.qv24 < MIN_24H_QUOTE_VOL or spread > 0.50:
         return None
 
-    deltas = minute_volume_deltas(samples)
-    if len(deltas) < 5:
-        return None
-    current_delta = max(0.0, cur.qv24 - samples[-2].qv24)
-    baseline_pool = deltas[:-1][-20:]
-    baseline = statistics.median(baseline_pool) if baseline_pool else 0.0
-    if baseline <= 0:
-        return None
-    vol_ratio = max(current_delta / baseline, gate_volume_ratio(pair))
+    if metrics:
+        # Price and volume are now from Exchange Spot closed 1m candles,
+        # NOT the difference of two 24h sliding-volume counters.
+        vol_ratio = metrics["volume_ratio"]
+        if not tracking and metrics["volume_1m_usd_est"] < 150:
+            return None
+    else:
+        # Legacy-only fallback retained for deterministic regression fixtures;
+        # production passes fresh Exchange candle metrics to all evaluations.
+        deltas = minute_volume_deltas(samples)
+        if len(deltas) < 5:
+            return None
+        current_delta = max(0.0, cur.qv24 - samples[-2].qv24)
+        baseline_pool = deltas[:-1][-20:]
+        baseline = statistics.median(baseline_pool) if baseline_pool else 0.0
+        if baseline <= 0:
+            return None
+        vol_ratio = min(80, max(current_delta / baseline, gate_volume_ratio(pair)))
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
     # A new candidate must cross the early trigger. An existing pilot is different:
     # keep measuring its trajectory even after the anomaly cools down, otherwise
     # TRACKED pilots become dead memory and can never prove continuation/failure.
-    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
-        return None
+    if not tracking:
+        if metrics:
+            # Early accumulation can be nearly flat. For weak bursts require a
+            # price impulse as independent evidence.
+            if not (vol_ratio >= EARLY_MIN_VOLUME_RATIO and ret5 >= -0.25
+                    or vol_ratio >= 1.30 and ret5 >= 0.45):
+                return None
+        elif vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
+            return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
     if not tracking and (ret5 > EARLY_MAX_RET5 or ret15 > 10.0):
