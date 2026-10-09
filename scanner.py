@@ -1435,8 +1435,14 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
+    hi = review.entry_high
+    costs = max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT)
+    net1 = (review.tp1/hi-1)*100-costs
+    net2 = (review.tp2/hi-1)*100-costs
+    risk = (hi-review.invalidation)/hi*100+costs
+    rr = net2/risk if risk>0 else 0.0
     return (
-        f"TRADE EXPLOITABLE — NOUVELLE ENTRÉE À VALIDER\n"
+        f"PEPITO — ENTRÉE QUALIFIÉE, PRIX À RESPECTER\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
         f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
@@ -1446,12 +1452,16 @@ def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
         f"Invalidation : {review.invalidation:.10g}\n"
         f"TP1 : {review.tp1:.10g}\n"
         f"TP2 : {review.tp2:.10g}\n"
-        f"Confiance IA : {review.confidence}/100\n\n"
+        f"Confiance IA : {review.confidence}/100\n"
+        f"Potentiel net estimé après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
+        f"Perte stop coûts inclus (est.) : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
         f"Pourquoi : {review.reason}\n\n"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
         f"spread {s.spread_pct:.3f}%\n"
-        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
+        f"⚠️ Valable 3 minutes maximum ET uniquement si l'ask Exchange est dans la zone d'entrée.\n"
+        f"⚠️ Si le prix sort de la zone ou franchit l'invalidation, PAS D'ACHAT.\n"
+        f"Frais et glissement estimés, profits non garantis.\n"
         f"Source prix/volume : Crypto.com Exchange (Spot) | Gate.io : auxiliaire"
     )
 
