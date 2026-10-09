@@ -6,6 +6,7 @@ import math
 import json
 import sqlite3
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -78,7 +79,7 @@ HISTORY_MAX_MIN = int(os.getenv("HISTORY_MAX_MIN", "450"))
 
 EXCLUDED_BASES = {
     "USDC", "USDE", "USDS", "FDUSD", "TUSD", "DAI", "PYUSD", "USD1",
-    "EUR", "EURC", "EURI", "USDP", "GUSD", "BUSD"
+    "EUR", "EURC", "EURI", "USDP", "GUSD", "BUSD", "USDT", "USD", "USDD", "USDDC"
 }
 
 session = requests.Session()
@@ -95,7 +96,13 @@ cdc_market_by_base = {}
 cdc_ticker_by_pair = {}
 gate_aux_history = defaultdict(lambda: deque(maxlen=50))
 candle_cache = {}
-CANDLE_ENRICH_PER_SCAN = int(os.getenv("CANDLE_ENRICH_PER_SCAN", "18"))
+CANDLE_ROTATION_PER_SCAN = int(os.getenv("CANDLE_ROTATION_PER_SCAN", "500"))
+CANDLE_FOCUS_PER_SCAN = int(os.getenv("CANDLE_FOCUS_PER_SCAN", "20"))
+CANDLE_TRACKED_PER_SCAN = int(os.getenv("CANDLE_TRACKED_PER_SCAN", "28"))
+CANDLE_WORKERS = min(6, max(1, int(os.getenv("CANDLE_WORKERS", "6"))))
+_candle_cursor = 0
+_track_cursor = 0
+v5_diagnostics = Counter()
 CANDLE_MIN_FRESH_SEC = int(os.getenv("CANDLE_MIN_FRESH_SEC", "140"))
 V4_BACKTEST_MODE = os.getenv("PEPITO_SELFTEST", "0").lower() in {"1","true","yes","on"}
 
@@ -585,8 +592,11 @@ def cdc_candle_metrics(pair, now=None):
             fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
             ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
         closes = [fnum(x["c"]) for x in closed]
+        # Cap pathological ratios from sparse, thin markets: x50k is not credible.
+        ratio = min(80.0, max(0.0, ratio))
         metrics = {
-            "volume_ratio": ratio, "r5": pct(closes[-1], closes[-6]),
+            "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
             "volume_1m_usd_est": values[-1], "age_sec": now - fnum(closed[-1]["t"]) / 1000.0 - 60,
             "high_45m": max(fnum(x.get("h")) for x in closed[-40:]),
@@ -610,6 +620,57 @@ def gate_volume_ratio(pair):
     baseline = statistics.median(deltas[:-1][-20:])
     latest = max(0.0, samples[-1].qv24 - samples[-2].qv24)
     return latest / baseline if baseline > 0 else 0.0
+
+
+def v5_choose_candle_pairs(tickers):
+    """Rotating market coverage + priority watchlist. Never wait for a 24h delta to
+    decide whether a market deserves its first real 1m-volume inspection.
+    """
+    global _candle_cursor, _track_cursor
+    available = {t["currency_pair"]: t for t in tickers
+                 if not excluded_pair(t["currency_pair"])}
+    universe = sorted(available)
+    if not universe:
+        return []
+    start = _candle_cursor % len(universe)
+    rotation = [universe[(start+i) % len(universe)]
+                for i in range(min(CANDLE_ROTATION_PER_SCAN, len(universe)))]
+    _candle_cursor = (start + len(rotation)) % len(universe)
+    # Focus on fresh 5m price impulses, then 24h changes that have not already
+    # run too far. A quote remains non-tradable until full risk/fee checks pass.
+    def priority(pair):
+        t = available[pair]
+        samples = history.get(pair) or []
+        prev = closest_before(samples, 4*60+30) if samples else None
+        move5 = pct(samples[-1].price, prev.price) if prev else 0.0
+        day = fnum(t.get("change_percentage"))
+        return (max(0, move5)*4 + (min(16, max(0, day))*0.13)
+                + min(3, max(0, math.log10(max(1, fnum(t.get("quote_volume")))) - 5)))
+    focus = sorted(universe, key=priority, reverse=True)[:CANDLE_FOCUS_PER_SCAN]
+    watching = sorted((p for p in pilots if p in available),
+                      key=lambda p: (-pilots[p].best_score, p))
+    tracked = []
+    if watching:
+        ts = _track_cursor % len(watching)
+        tracked = [watching[(ts+i) % len(watching)]
+                   for i in range(min(CANDLE_TRACKED_PER_SCAN, len(watching)))]
+        _track_cursor = (ts+len(tracked)) % len(watching)
+    return list(dict.fromkeys(focus + tracked + rotation))
+
+
+def v5_load_candles(pairs, now):
+    """Concurrently fetch read-only Exchange 1m candles with a strict worker cap."""
+    out = {}
+    if not pairs:
+        return out
+    def one(pair):
+        m = cdc_candle_metrics(pair, now)
+        return pair, m
+    with ThreadPoolExecutor(max_workers=CANDLE_WORKERS) as executor:
+        for pair, data in executor.map(one, pairs):
+            if data and data.get("age_sec", 9999) <= CANDLE_MIN_FRESH_SEC:
+                out[pair] = data
+    return out
 
 
 def add_snapshot(ticker, now):
@@ -647,21 +708,24 @@ def minute_volume_deltas(samples):
     return out
 
 
-def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False) -> Optional[Signal]:
+def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bool = False,
+                 metrics=None) -> Optional[Signal]:
     samples = history[pair]
-    if len(samples) < 7:
+    # A new listing can be screened after two ticker observations when recent,
+    # REAL closed 1-minute candles already provide the 1/5/15m history.
+    if len(samples) < (1 if metrics else 7):
         return None
 
     cur = samples[-1]
     s1 = closest_before(samples, 55)
     s5 = closest_before(samples, 4 * 60 + 30)
     s15 = closest_before(samples, 14 * 60 + 30)
-    if not s1 or not s5:
+    if not metrics and (not s1 or not s5):
         return None
 
-    ret1 = pct(cur.price, s1.price)
-    ret5 = pct(cur.price, s5.price)
-    ret15 = pct(cur.price, s15.price) if s15 else 0.0
+    ret1 = metrics["r1"] if metrics else pct(cur.price, s1.price)
+    ret5 = metrics["r5"] if metrics else pct(cur.price, s5.price)
+    ret15 = metrics["r15"] if metrics else (pct(cur.price, s15.price) if s15 else 0.0)
     # 24h est enrichi depuis le ticker Gate après scoring; pour le scoring lui-même,
     # on le calcule depuis l’historique local quand 24h est disponible, sinon 0.
     s24 = closest_before(samples, 24 * 60 * 60 - 30)
@@ -675,23 +739,39 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     if cur.qv24 < MIN_24H_QUOTE_VOL or spread > 0.50:
         return None
 
-    deltas = minute_volume_deltas(samples)
-    if len(deltas) < 5:
-        return None
-    current_delta = max(0.0, cur.qv24 - samples[-2].qv24)
-    baseline_pool = deltas[:-1][-20:]
-    baseline = statistics.median(baseline_pool) if baseline_pool else 0.0
-    if baseline <= 0:
-        return None
-    vol_ratio = max(current_delta / baseline, gate_volume_ratio(pair))
+    if metrics:
+        # Price and volume are now from Exchange Spot closed 1m candles,
+        # NOT the difference of two 24h sliding-volume counters.
+        vol_ratio = metrics["volume_ratio"]
+        if not tracking and metrics["volume_1m_usd_est"] < 150:
+            return None
+    else:
+        # Legacy-only fallback retained for deterministic regression fixtures;
+        # production passes fresh Exchange candle metrics to all evaluations.
+        deltas = minute_volume_deltas(samples)
+        if len(deltas) < 5:
+            return None
+        current_delta = max(0.0, cur.qv24 - samples[-2].qv24)
+        baseline_pool = deltas[:-1][-20:]
+        baseline = statistics.median(baseline_pool) if baseline_pool else 0.0
+        if baseline <= 0:
+            return None
+        vol_ratio = min(80, max(current_delta / baseline, gate_volume_ratio(pair)))
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
     # A new candidate must cross the early trigger. An existing pilot is different:
     # keep measuring its trajectory even after the anomaly cools down, otherwise
     # TRACKED pilots become dead memory and can never prove continuation/failure.
-    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
-        return None
+    if not tracking:
+        if metrics:
+            # Early accumulation can be nearly flat. For weak bursts require a
+            # price impulse as independent evidence.
+            if not (vol_ratio >= EARLY_MIN_VOLUME_RATIO and ret5 >= -0.25
+                    or vol_ratio >= 1.30 and ret5 >= 0.45):
+                return None
+        elif vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
+            return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
     if not tracking and (ret5 > EARLY_MAX_RET5 or ret15 > 10.0):
@@ -751,8 +831,6 @@ def cleanup_expired_pilots(now: float):
     expired = [pair for pair, p in pilots.items() if now - p.created_at > ttl]
     for pair in expired:
         p = pilots.pop(pair)
-        if _state_db is not None:
-            _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
         if _state_db is not None:
             _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
         ai_next_review_at.pop(pair, None)
@@ -1211,65 +1289,77 @@ def ai_review_batch(candidates):
 
 
 def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
-    """Garde-fous déterministes avant toute notification Slack."""
-    if review.decision != "TRADE" or review.confidence < 70:
+    """Fail-closed order validation, diagnostic reason for EVERY rejection.
+    Trades are never automatically placed; only qualified Slack alerts are sent.
+    """
+    pair = c.signal.pair
+    def deny(reason, detail=""):
+        print(f"V5 REFUS — {pair} | cause={reason}"+(f" | {detail}" if detail else ""),flush=True)
         return False
-    if not cdc_tradeable(c.signal.pair):
-        print(f"TRADE BLOQUE CDC — {c.signal.pair} absent de Crypto.com Exchange spot", flush=True)
-        return False
+
+    if review.decision != "TRADE":
+        return deny("ai_not_trade")
+    if review.confidence < 70:
+        return deny("ai_confidence", f"value={review.confidence}")
+    if not cdc_tradeable(pair):
+        return deny("not_exchange_spot")
     vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
-    if any(v is None or v <= 0 for v in vals):
-        return False
+    if any(v is None or v<=0 for v in vals):
+        return deny("missing_order_levels")
     lo, hi, inv, tp1, tp2 = vals
-    if lo > hi or not (inv < lo <= hi < tp1 < tp2):
-        return False
-    # Reject stale or out-of-market AI entry zones.
-    if abs(pct(c.signal.price, (lo + hi) / 2.0)) > MAX_ENTRY_DRIFT_PCT:
-        return False
+    if lo>hi or not (inv<lo<=hi<tp1<tp2):
+        return deny("invalid_level_order", f"entry={lo}:{hi} stop={inv} tp1={tp1} tp2={tp2}")
+    distance = abs(pct(c.signal.price, (lo+hi)/2))
+    if distance > MAX_ENTRY_DRIFT_PCT:
+        return deny("stale_entry_zone", f"drift={distance:.2f}% max={MAX_ENTRY_DRIFT_PCT:.2f}%")
 
-    # Check worst executable entry within the proposed zone (hi), not midpoint.
-    # Use a conservative round-trip cost reserve; actual app quotes may be worse.
     costs_pct = max(0.0, ROUND_TRIP_FEE_PCT) + max(0.0, EXECUTION_BUFFER_PCT)
-    gross_tp1_pct = (tp1 / hi - 1.0) * 100.0
-    gross_tp2_pct = (tp2 / hi - 1.0) * 100.0
-    net_tp1_pct = gross_tp1_pct - costs_pct
-    net_tp2_pct = gross_tp2_pct - costs_pct
-    loss_including_costs_pct = (hi - inv) / hi * 100.0 + costs_pct
-    net_rr = net_tp2_pct / loss_including_costs_pct if loss_including_costs_pct > 0 else 0.0
+    net_tp1 = (tp1/hi-1.0)*100.0-costs_pct
+    net_tp2 = (tp2/hi-1.0)*100.0-costs_pct
+    risk = (hi-inv)/hi*100.0+costs_pct
+    net_rr = net_tp2/risk if risk>0 else 0.0
+    detail=(f"TP1_net={net_tp1:+.2f}% TP2_net={net_tp2:+.2f}% "
+            f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
+    if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
+        return deny("net_profit_or_reward_risk",detail)
+    if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style=="MOMENTUM":
+        return deny("stale_momentum",f"age={c.age_min:.0f}m")
+    cap = (12.0 if c.style=="CONTINUATION" else
+           2.5 if c.style=="SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN)
+    if c.price_gain > cap:
+        return deny("overextended_since_pilot",f"gain={c.price_gain:+.2f}% cap={cap:.2f}%")
 
-    if (net_tp1_pct < MIN_NET_TP1_PCT
-            or net_tp2_pct < MIN_NET_TP2_PCT
-            or net_rr < MIN_NET_REWARD_RISK):
-        print(
-            f"TRADE BLOQUE RENTABILITE — {c.signal.pair} | "
-            f"TP1_net={net_tp1_pct:+.2f}% | TP2_net={net_tp2_pct:+.2f}% | "
-            f"risque_frais={loss_including_costs_pct:.2f}% | "
-            f"RR_net={net_rr:.2f} | reserve_frais={costs_pct:.2f}%",
-            flush=True,
-        )
-        return False
-
-    if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
-        return False
-    if c.price_gain > (12.0 if c.style == "CONTINUATION" else
-                       2.5 if c.style == "SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN):
-        return False
     if not V4_BACKTEST_MODE:
-        x = cdc_ticker_by_pair.get(c.signal.pair)
-        if not x or not cdc_tradeable(c.signal.pair):
-            return False
-        # Recent Exchange-native candle and a live executable quote are mandatory.
-        m = cdc_candle_metrics(c.signal.pair)
-        if not m or m["age_sec"] > CANDLE_MIN_FRESH_SEC:
-            return False
-        # No apparent momentum is tradable on zero CDC execution volume.
+        market = cdc_ticker_by_pair.get(pair)
+        if not market:
+            return deny("missing_live_exchange_market")
+        m = cdc_candle_metrics(pair)
+        if not m or m["age_sec"]>CANDLE_MIN_FRESH_SEC:
+            return deny("stale_exchange_candles")
         if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
-            return False
+            return deny("insufficient_real_exchange_volume",
+                        f"1m_usd={m['volume_1m_usd_est']:.0f} x={m['volume_ratio']:.1f}")
         if m["volume_ratio"] < 1.2 and m["r5"] < 0.25:
-            return False
-        if abs(c.signal.price / fnum(x["last"]) - 1.0) > 0.003:
-            return False
-    return True
+            return deny("no_volume_or_momentum_confirmation",
+                        f"vol=x{m['volume_ratio']:.1f} r5={m['r5']:+.2f}%")
+        if abs(c.signal.price/max(1e-12,fnum(market["last"]))-1.0)>0.003:
+            return deny("market_moved_after_scan")
+        # Re-quote the actual exchange spot orderbook immediately before notifying
+        # the user; the AI may have been running for many seconds.
+        try:
+            rq = session.get(CDC_TICKERS_URL,
+                             params={"instrument_name":market["exchange_symbol"]},
+                             timeout=8)
+            rq.raise_for_status()
+            live = normalize_cdc_tickers(rq.json(),
+                                         {market["exchange_symbol"]},time.time())
+            if not live:
+                return deny("no_fresh_executable_quote")
+            ask = fnum(live[0].get("lowest_ask"))
+            if ask<=0 or not (lo*0.9985<=ask<=hi*1.001):
+                return deny("ask_outside_buy_zone",f"ask={ask:.10g} entry={lo:.10g}:{hi:.10g}")
+        except Exception as exc:
+            return deny("exchange_requote_error",f"exception={type(exc).__name__}")
     return True
 
 
@@ -1395,47 +1485,34 @@ def run():
                 if action:
                     print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
 
+            # V5: MARKET COVERAGE BEFORE scoring. Previously almost every coin
+            # was discarded on a 24h rolling-volume delta before requesting 1m data.
+            # Evaluate a full market rotation plus active pilots and fresh movers.
+            chosen = v5_choose_candle_pairs(tickers)
+            fresh_candles = v5_load_candles(chosen, now)
             raw_signals = []
-            signal_by_pair = {}
-            for pair in list(history.keys()):
-                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
-                sig = score_signal(pair, gate24)
-                if not sig:
-                    continue
-                raw_signals.append(sig)
-                signal_by_pair[pair] = sig
-
-            raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
-            early_count = len(raw_signals)
-            # Enrich only a budgeted subset with actual 1-minute traded volume.
-            # Run the enrichment before trajectory confirmations and AI.
-            to_enrich = raw_signals[:CANDLE_ENRICH_PER_SCAN//2]
-            for sig in to_enrich:
-                metrics = cdc_candle_metrics(sig.pair, now)
-                if metrics:
-                    sig.vol_ratio = metrics["volume_ratio"]
-                    sig.ret_5m = metrics["r5"]
-                    sig.ret_15m = metrics["r15"]
-            cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
-
-            # Multi-pass follow-up is independent from the initial anomaly trigger.
-            # Every live pilot gets a tracking score each cycle, even when vol_ratio
-            # has cooled below EARLY_MIN_VOLUME_RATIO.
             tracked_signals = []
-            for pair in list(pilots.keys()):
-                if pair in positions or pair in signal_by_pair or pair not in history:
+            for pair, candle in fresh_candles.items():
+                if pair in positions or pair not in by_pair:
                     continue
-                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
-                sig = score_signal(pair, gate24, tracking=True)
+                gate24 = fnum(by_pair[pair].get("change_percentage"))
+                is_tracking = pair in pilots
+                sig = score_signal(pair, gate24, tracking=is_tracking, metrics=candle)
                 if sig:
-                    tracked_signals.append(sig)
-
-            for sig in sorted(tracked_signals, key=lambda x: (x.score, x.ret_5m), reverse=True)[:CANDLE_ENRICH_PER_SCAN//2]:
-                metrics = cdc_candle_metrics(sig.pair, now)
-                if metrics:
-                    sig.vol_ratio = metrics["volume_ratio"]
-                    sig.ret_5m = metrics["r5"]
-                    sig.ret_15m = metrics["r15"]
+                    if is_tracking:
+                        tracked_signals.append(sig)
+                    else:
+                        raw_signals.append(sig)
+            raw_signals.sort(key=lambda x: (x.score,x.vol_ratio), reverse=True)
+            tracked_signals.sort(key=lambda x: (x.score,x.vol_ratio),reverse=True)
+            early_count = len(raw_signals)
+            cdc_count = sum(1 for sig in raw_signals if cdc_tradeable(sig.pair))
+            print(
+                f"V5 DONNEES — actifs={len(tickers)} | bougies demandées={len(chosen)} "
+                f"| bougies fraîches={len(fresh_candles)} | sans bougies={len(chosen)-len(fresh_candles)} "
+                f"| nouveaux candidats={len(raw_signals)} | suivis actifs réévalués={len(tracked_signals)}",
+                flush=True
+            )
             gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
@@ -1642,6 +1719,37 @@ def pepito_selftest():
         assert not continuation_ok(falling,p_strk,18,2.0)
         assert PILOT_TTL_MIN >= 24*60
 
+        # V5: candle-first detection must not need a rising 24h volume counter.
+        # A freshly listed market with 2 observations is eligible via real 1m candles.
+        vp="V5FRESH_USDT"; history[vp].clear()
+        for i in range(2):
+            history[vp].append(Snapshot(now-60+i*60, 1.0+i*0.0001,
+                                        500_000, 0.9999, 1.0002))
+        real_candles = {
+            "volume_ratio":18.0, "volume_1m_usd_est":2100,
+            "r1":0.14,"r5":0.45,"r15":0.65,"age_sec":30
+        }
+        # 1m candles already include history even on the scanner's FIRST tick.
+        new_sig=score_signal(vp,0.0,metrics=real_candles)
+        assert new_sig is not None and new_sig.vol_ratio==18.0
+        history[vp].popleft()
+        first_tick_sig=score_signal(vp,0.0,metrics=real_candles)
+        assert first_tick_sig is not None and first_tick_sig.vol_ratio==18.0
+        assert new_sig.ret_5m==0.45
+        assert excluded_pair("USDT_USDT") and excluded_pair("USD_USDT")
+        pair_list = v5_choose_candle_pairs([{
+            "currency_pair":"OGN_USDT", "quote_volume":500000,
+            "change_percentage":2.0
+        },{
+            "currency_pair":"RLC_USDT","quote_volume":500000,
+            "change_percentage":1.0
+        },{
+            "currency_pair":"USDT_USDT","quote_volume":900000,
+            "change_percentage":0.0
+        }])
+        assert set(pair_list)=={"OGN_USDT","RLC_USDT"}, pair_list
+        history.pop(vp,None)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1685,7 +1793,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
