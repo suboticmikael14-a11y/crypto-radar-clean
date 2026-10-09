@@ -1566,6 +1566,12 @@ def run():
             due = []
             for c in confirmed:
                 pair = c.signal.pair
+                if c.signal.qv24 < MIN_24H_QUOTE_VOL:
+                    # Keep silently tracking; do not spend AI tokens on an
+                    # order that the execution gate is required to reject.
+                    print(f"V6 SUIVI SANS ACHAT — {pair} | volume24={c.signal.qv24:.0f} "
+                          f"< minimum execution={MIN_24H_QUOTE_VOL:.0f}", flush=True)
+                    continue
                 if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
                     print(
                         f"AI IGNORE — {pair} trop ancien | age={c.age_min:.0f}m > {AI_MAX_SIGNAL_AGE_MIN}m",
