@@ -1478,6 +1478,7 @@ def run():
     while True:
         started = time.time()
         try:
+            v5_diagnostics.clear()
             tickers = fetch_tickers()
             now = time.time()
             try:
@@ -1535,6 +1536,10 @@ def run():
                 f"| nouveaux candidats={len(raw_signals)} | suivis actifs réévalués={len(tracked_signals)}",
                 flush=True
             )
+            if v5_diagnostics:
+                print("V6 ENTONNOIR — " + " | ".join(
+                    f"{reason}={count}" for reason,count in v5_diagnostics.most_common(12)
+                ), flush=True)
             gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
