@@ -57,6 +57,10 @@ MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
 MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
 MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
 STOP_ATR_MULTIPLE = float(os.getenv("STOP_ATR_MULTIPLE", "2.25"))
+MIN_FINAL_AI_CONFIDENCE = int(os.getenv("MIN_FINAL_AI_CONFIDENCE", "78"))
+MIN_FINAL_SIGNAL_SCORE = int(os.getenv("MIN_FINAL_SIGNAL_SCORE", "60"))
+MIN_FINAL_RET5_PCT = float(os.getenv("MIN_FINAL_RET5_PCT", "0.25"))
+MIN_FINAL_RET15_PCT = float(os.getenv("MIN_FINAL_RET15_PCT", "0.45"))
 # Swing candidates are silent until validated by the same net-gain and CDC gates.
 SWING_ENABLED = os.getenv("SWING_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
 SWING_MIN_AGE_MIN = float(os.getenv("SWING_MIN_AGE_MIN", "8"))
@@ -1222,8 +1226,10 @@ def ai_review_batch(candidates):
         "Analyse trois profils: MOMENTUM (30 min-6 heures), SWING_ACCUMULATION (1-7 jours) "
         "et CONTINUATION (1h-48h): le volume d'origine peut retomber après un déclenchement "
         "historique important, sans annuler une hausse confirmée. "
-        "Un SWING_ACCUMULATION peut accumuler des volumes anormaux alors que les retours 5m/15m "
-        "sont encore faibles: ne le rejette pas pour cette seule raison. "
+        "Un SWING_ACCUMULATION peut être surveillé silencieusement lorsque ses retours 5m/15m "
+        "sont encore faibles, mais aucun TRADE ne doit être proposé avant une vraie réaccélération. "
+        "Au moment du TRADE, exige une confiance d'au moins 78/100, un score de marché >=60, "
+        "une progression >=0,25% sur 5m et >=0,45% sur 15m. "
         "Pour SWING_ACCUMULATION, lis les prix hauts/bas et amplitudes des horizons "
         "6h/24h/7j dans persistent_context et refuse les objectifs incompatibles. "
         "et exige un potentiel de continuation justifié par les données fournies. "
@@ -1347,8 +1353,16 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
     if review.decision != "TRADE":
         return deny("ai_not_trade")
-    if review.confidence < 70:
-        return deny("ai_confidence", f"value={review.confidence}")
+    if review.confidence < MIN_FINAL_AI_CONFIDENCE:
+        return deny("ai_confidence",f"value={review.confidence} min={MIN_FINAL_AI_CONFIDENCE}")
+    if c.signal.score < MIN_FINAL_SIGNAL_SCORE:
+        return deny("signal_strength_insufficient",
+                    f"score={c.signal.score} min={MIN_FINAL_SIGNAL_SCORE}")
+    if (c.signal.ret_5m < MIN_FINAL_RET5_PCT or
+            c.signal.ret_15m < MIN_FINAL_RET15_PCT):
+        return deny("price_acceleration_not_confirmed",
+                    f"r5={c.signal.ret_5m:+.2f}% min={MIN_FINAL_RET5_PCT:.2f}% "
+                    f"r15={c.signal.ret_15m:+.2f}% min={MIN_FINAL_RET15_PCT:.2f}%")
     if not cdc_tradeable(pair):
         return deny("not_exchange_spot")
     if c.signal.qv24 < MIN_24H_QUOTE_VOL:
@@ -1400,6 +1414,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         atr_pct = fnum(m.get("atr_1m_pct"),0)
         if atr_pct <= 0:
             return deny("missing_volatility_evidence")
+        if m["r5"] < MIN_FINAL_RET5_PCT or m["r15"] < MIN_FINAL_RET15_PCT:
+            return deny("live_closed_candle_momentum_not_confirmed",
+                        f"r5={m['r5']:+.2f}% r15={m['r15']:+.2f}%")
         min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
         if stop_distance_pct < min_stop:
             return deny("stop_under_normal_volatility",
