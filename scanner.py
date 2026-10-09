@@ -96,7 +96,7 @@ cdc_market_by_base = {}
 cdc_ticker_by_pair = {}
 gate_aux_history = defaultdict(lambda: deque(maxlen=50))
 candle_cache = {}
-CANDLE_ROTATION_PER_SCAN = int(os.getenv("CANDLE_ROTATION_PER_SCAN", "85"))
+CANDLE_ROTATION_PER_SCAN = int(os.getenv("CANDLE_ROTATION_PER_SCAN", "500"))
 CANDLE_FOCUS_PER_SCAN = int(os.getenv("CANDLE_FOCUS_PER_SCAN", "20"))
 CANDLE_TRACKED_PER_SCAN = int(os.getenv("CANDLE_TRACKED_PER_SCAN", "28"))
 CANDLE_WORKERS = min(6, max(1, int(os.getenv("CANDLE_WORKERS", "6"))))
