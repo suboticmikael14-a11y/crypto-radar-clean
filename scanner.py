@@ -736,7 +736,11 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
         mid = (cur.ask + cur.bid) / 2
         spread = (cur.ask - cur.bid) / mid * 100.0 if mid else 999.0
 
-    if cur.qv24 < MIN_24H_QUOTE_VOL or spread > 0.50:
+    if cur.qv24 < MIN_24H_QUOTE_VOL:
+        v5_diagnostics["volume_24h_insuffisant"] += 1
+        return None
+    if spread > 0.50:
+        v5_diagnostics["spread_trop_large"] += 1
         return None
 
     if metrics:
@@ -744,6 +748,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
         # NOT the difference of two 24h sliding-volume counters.
         vol_ratio = metrics["volume_ratio"]
         if not tracking and metrics["volume_1m_usd_est"] < 150:
+            v5_diagnostics["volume_1m_insuffisant"] += 1
             return None
     else:
         # Legacy-only fallback retained for deterministic regression fixtures;
@@ -775,12 +780,15 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
             if not (vol_ratio >= EARLY_MIN_VOLUME_RATIO and ret5 >= -0.25
                     or vol_ratio >= 1.30 and ret5 >= 0.45
                     or quiet_second_leg):
+                v5_diagnostics["pas_d_anomalie_precoce"] += 1
                 return None
         elif vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
             return None
     if ret1 < -0.35 or ret5 < -0.75:
+        v5_diagnostics["momentum_negatif"] += 1
         return None
     if not tracking and (ret5 > EARLY_MAX_RET5 or ret15 > 10.0):
+        v5_diagnostics["bougie_trop_etendue"] += 1
         return None
 
     # PEPITO scoring verrouillé: 30/20/15/15/10/10.
@@ -802,12 +810,14 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
 
     # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
     if not tracking and ret15 > 9.0:
+        v5_diagnostics["retour_15m_trop_etendu"] += 1
         return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
     if not tracking and score < early_score_floor and ret5 < 0.65 and not quiet_second_leg:
+        v5_diagnostics["score_radar_insuffisant"] += 1
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
