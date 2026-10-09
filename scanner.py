@@ -1660,8 +1660,31 @@ def pepito_selftest():
         history.pop("SELFACCEL_USDT", None)
 
 
+
+def pepito_integration_test():
+    """Read-only real data verification: never sends Slack or places any orders."""
+    refresh_cdc_pairs()
+    all_tickers = fetch_tickers()
+    assert len(all_tickers) >= 100, "CDC market coverage unexpectedly low"
+    checked = []
+    for asset in ("OGN", "STRK", "RLC"):
+        pair = asset + "_USDT"
+        item = cdc_ticker_by_pair.get(pair)
+        assert item, f"Exchange ticker missing: {asset}"
+        candle = cdc_candle_metrics(pair)
+        assert candle and candle["volume_1m_usd_est"] >= 0, f"1m candles missing: {asset}"
+        context = gate_historical_context(pair, time.time())
+        assert context, f"6h/24h context missing: {asset}"
+        checked.append(f"{asset}={item['exchange_symbol']} 1m_vol={candle['volume_1m_usd_est']:.0f} "
+                       f"r5={candle['r5']:+.2f}% c6h={context.get('6h',{}).get('return_pct','NA')}")
+    print("PEPITO V4 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
+          +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
+
+
 if __name__ == "__main__":
-    if os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
+    if os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
+        pepito_integration_test()
+    elif os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
         pepito_selftest()
     else:
         run()
