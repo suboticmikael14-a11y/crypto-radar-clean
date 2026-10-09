@@ -27,7 +27,7 @@ EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
 PILOT_SCORE = int(os.getenv("PILOT_SCORE", "78"))
 CONFIRMED_SCORE = int(os.getenv("CONFIRMED_SCORE", "90"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
-PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "60"))
+PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "1440"))
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
@@ -49,10 +49,14 @@ AI_OUTPUT_TOKEN_BUDGET = int(os.getenv("AI_OUTPUT_TOKEN_BUDGET", "3000"))
 # The app can charge a different price/fee: never promise an executable profit.
 ROUND_TRIP_FEE_PCT = float(os.getenv("ROUND_TRIP_FEE_PCT", "1.00"))
 EXECUTION_BUFFER_PCT = float(os.getenv("EXECUTION_BUFFER_PCT", "0.30"))
-MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "0.75"))
-MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "3.00"))
+MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "2.00"))
+MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "6.00"))
 MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
+MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
+MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
+STOP_ATR_MULTIPLE = float(os.getenv("STOP_ATR_MULTIPLE", "2.25"))
 # Swing candidates are silent until validated by the same net-gain and CDC gates.
 SWING_ENABLED = os.getenv("SWING_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
 SWING_MIN_AGE_MIN = float(os.getenv("SWING_MIN_AGE_MIN", "8"))
@@ -593,10 +597,23 @@ def cdc_candle_metrics(pair, now=None):
             fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
             ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
         closes = [fnum(x["c"]) for x in closed]
+        # Median one-minute true range from CLOSED Exchange spot candles, not
+        # a fixed stop just below the AI-generated entry.
+        true_ranges = []
+        for i in range(max(1, len(closed)-20),len(closed)):
+            prev_close = closes[i-1]
+            high = fnum(closed[i].get("h"))
+            low = fnum(closed[i].get("l"))
+            if prev_close > 0 and high >= low > 0:
+                true_ranges.append(
+                    100.0*max(high-low,abs(high-prev_close),abs(low-prev_close))/prev_close
+                )
+        median_true_range_pct = statistics.median(true_ranges) if true_ranges else 0.0
         # Cap pathological ratios from sparse, thin markets: x50k is not credible.
         ratio = min(80.0, max(0.0, ratio))
         metrics = {
             "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "atr_1m_pct": median_true_range_pct,
             "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
             "volume_1m_usd_est": values[-1], "age_sec": now - fnum(closed[-1]["t"]) / 1000.0 - 60,
@@ -1221,9 +1238,15 @@ def ai_review_batch(candidates):
         "Déclasse si le volume retombe fortement, si le mouvement paraît déjà consommé, si le spread/liquidité est faible, "
         "ou si le ratio rendement/risque n'est pas propre. "
         "Le coût estimé aller-retour est de 1,30% (frais, spread et exécution). "
-        "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 0,75% net, "
-        "TP2 au moins 3,0% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
+        "Le stop doit être assez large pour la volatilité réelle: minimum 0,55% en MOMENTUM, "
+        "0,80% en CONTINUATION et 1,35% en SWING_ACCUMULATION, "
+        "et au moins 2,25 fois la volatilité médiane des bougies 1m fournie. "
+        "Ne raccourcis jamais le stop artificiellement pour améliorer le ratio rendement/risque. "
+        "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 2% net, "
+        "TP2 au moins 6% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
         "Ne gonfle JAMAIS les objectifs pour contourner ce filtre: WAIT si les données ne justifient pas un tel potentiel. "
+        "Sans place réaliste vers des niveaux hauts cohérents 6h/24h/7j, réponds WAIT, "
+        "même pour une crypto à fort volume. Le prix doit encore être dans la zone au moment de l'alerte. "
         "Pour TRADE seulement, fournis une zone d'entrée autour du prix actuel, une invalidation sous l'entrée, "
         "et TP1/TP2 au-dessus. Les niveaux doivent être cohérents avec un trade court terme, pas des objectifs fantaisistes. "
         "La raison doit être en français, concrète, en une phrase courte."
@@ -1350,6 +1373,16 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
     if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
         return deny("net_profit_or_reward_risk",detail)
+    # Start with a style-dependent minimum stop; live data will increase the
+    # required distance when true range is wider than ordinary conditions.
+    min_stop = (
+        MIN_STOP_SWING_PCT if c.style=="SWING_ACCUMULATION" else
+        MIN_STOP_CONTINUATION_PCT if c.style=="CONTINUATION" else
+        MIN_STOP_MOMENTUM_PCT
+    )
+    stop_distance_pct = (hi-inv)/hi*100.0
+    if stop_distance_pct < min_stop:
+        return deny("stop_too_tight",f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% style={c.style}")
     if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style=="MOMENTUM":
         return deny("stale_momentum",f"age={c.age_min:.0f}m")
     cap = (12.0 if c.style=="CONTINUATION" else
@@ -1364,6 +1397,14 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         m = cdc_candle_metrics(pair)
         if not m or m["age_sec"]>CANDLE_MIN_FRESH_SEC:
             return deny("stale_exchange_candles")
+        atr_pct = fnum(m.get("atr_1m_pct"),0)
+        if atr_pct <= 0:
+            return deny("missing_volatility_evidence")
+        min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
+        if stop_distance_pct < min_stop:
+            return deny("stop_under_normal_volatility",
+                        f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% "
+                        f"atr_1m={atr_pct:.3f}%")
         if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
             return deny("insufficient_real_exchange_volume",
                         f"1m_usd={m['volume_1m_usd_est']:.0f} x={m['volume_ratio']:.1f}")
@@ -1384,8 +1425,15 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             if not live:
                 return deny("no_fresh_executable_quote")
             ask = fnum(live[0].get("lowest_ask"))
-            if ask<=0 or not (lo*0.9985<=ask<=hi*1.001):
+            bid = fnum(live[0].get("highest_bid"))
+            if ask<=0 or not (lo<=ask<=hi):
                 return deny("ask_outside_buy_zone",f"ask={ask:.10g} entry={lo:.10g}:{hi:.10g}")
+            if bid<=0 or 100.0*(ask-bid)/((ask+bid)/2) > CONFIRM_MAX_SPREAD:
+                return deny("live_spread_too_wide")
+            live_stop = 100.0*(ask-inv)/ask
+            if live_stop < min_stop:
+                return deny("stop_too_tight_at_live_ask",
+                            f"stop={live_stop:.2f}% min={min_stop:.2f}%")
         except Exception as exc:
             return deny("exchange_requote_error",f"exception={type(exc).__name__}")
     return True
@@ -1393,8 +1441,14 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
+    hi = review.entry_high
+    costs = max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT)
+    net1 = (review.tp1/hi-1)*100-costs
+    net2 = (review.tp2/hi-1)*100-costs
+    risk = (hi-review.invalidation)/hi*100+costs
+    rr = net2/risk if risk>0 else 0.0
     return (
-        f"TRADE EXPLOITABLE — NOUVELLE ENTRÉE À VALIDER\n"
+        f"PEPITO — ENTRÉE QUALIFIÉE, PRIX À RESPECTER\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
         f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
@@ -1404,12 +1458,16 @@ def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
         f"Invalidation : {review.invalidation:.10g}\n"
         f"TP1 : {review.tp1:.10g}\n"
         f"TP2 : {review.tp2:.10g}\n"
-        f"Confiance IA : {review.confidence}/100\n\n"
+        f"Confiance IA : {review.confidence}/100\n"
+        f"Potentiel net estimé après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
+        f"Perte stop coûts inclus (est.) : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
         f"Pourquoi : {review.reason}\n\n"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
         f"spread {s.spread_pct:.3f}%\n"
-        f"⚠️ Si le prix sort de la zone avant ton entrée, ne poursuis pas le mouvement.\n"
+        f"⚠️ Valable 3 minutes maximum ET uniquement si l'ask Exchange est dans la zone d'entrée.\n"
+        f"⚠️ Si le prix sort de la zone ou franchit l'invalidation, PAS D'ACHAT.\n"
+        f"Frais et glissement estimés, profits non garantis.\n"
         f"Source prix/volume : Crypto.com Exchange (Spot) | Gate.io : auxiliaire"
     )
 
@@ -1466,7 +1524,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V4 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->TRADE | "
+        f"VALIDATION V7 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1707,6 +1765,28 @@ def pepito_selftest():
             weak = AIReview(pair, "TRADE", 96, "momentum", lo, hi, inv, tp1, tp2)
             assert not validate_trade_review(weak, candidate(pair, price)), pair
 
+        # V7: previously sent ADA/QNT messages must NOT qualify as valuable trades.
+        assert MIN_NET_TP1_PCT >= 2.0 and MIN_NET_TP2_PCT >= 6.0
+        for pair,px,lo,hi,inv,tp1,tp2 in [
+            ("ADA_USDT",0.24223,0.2418,0.2423,0.2408,0.2473,0.2548),
+            ("ADA_USDT",0.23886,0.2386,0.2390,0.2382,0.2441,0.2502),
+            ("QNT_USDT",250.619,250.4,250.7,249.8,256.2,264.0),
+        ]:
+            cdc_pairs.add(pair.replace("_USDT","_USD"))
+            weak=AIReview(pair,"TRADE",99,"previous real Slack",lo,hi,inv,tp1,tp2)
+            assert not validate_trade_review(weak,candidate(pair,px)),pair
+        # A high target cannot make a sub-noise stop acceptable.
+        too_tight=AIReview("NIGHT_USDT","TRADE",98,"unrealistic stop",
+                           1.019,1.020,1.017,1.080,1.190)
+        assert not validate_trade_review(too_tight,candidate("NIGHT_USDT",1.0195))
+        assert validate_trade_review(review("NIGHT_USDT"),candidate("NIGHT_USDT"))
+        info=format_trade_alert(candidate("NIGHT_USDT"),review("NIGHT_USDT"))
+        assert "Potentiel net estimé" in info and "3 minutes maximum" in info
+        last_alert_at["ADA_USDT"]=now-12*3600
+        assert not can_alert("ADA_USDT",now)
+        assert can_alert("ADA_USDT",now+12*3600)
+        last_alert_at.pop("ADA_USDT",None)
+
         # Never accept far-from-market order zones even with ambitious objectives.
         stale = AIReview("NIGHT_USDT", "TRADE", 99, "stale", 1.05, 1.06, 1.02, 1.12, 1.25)
         assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
@@ -1870,7 +1950,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
@@ -1897,7 +1977,14 @@ def pepito_integration_test():
         assert context, f"6h/24h context missing: {asset}"
         checked.append(f"{asset}={item['exchange_symbol']} 1m_vol={candle['volume_1m_usd_est']:.0f} "
                        f"r5={candle['r5']:+.2f}% c6h={context.get('6h',{}).get('return_pct','NA')}")
-    print("PEPITO V4 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
+    # Confirm the added volatility field on active Exchange markets.
+    for pair in ("ADA_USDT","QNT_USDT"):
+        if pair in cdc_ticker_by_pair:
+            data = cdc_candle_metrics(pair)
+            assert data and data.get("atr_1m_pct",0) > 0, f"Missing live ATR for {pair}"
+            print(f"V7 ATR EXCHANGE — {pair} | ATR1m={data['atr_1m_pct']:.3f}% "
+                  f"r5={data['r5']:+.2f}% fresh={data['age_sec']:.0f}s",flush=True)
+    print("PEPITO V7 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
           +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
 
 
