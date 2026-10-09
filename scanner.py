@@ -27,7 +27,7 @@ EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
 PILOT_SCORE = int(os.getenv("PILOT_SCORE", "78"))
 CONFIRMED_SCORE = int(os.getenv("CONFIRMED_SCORE", "90"))
 MAX_ALERTS_PER_SCAN = int(os.getenv("MAX_ALERTS_PER_SCAN", "3"))
-PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "60"))
+PAIR_COOLDOWN_MIN = int(os.getenv("PAIR_COOLDOWN_MIN", "1440"))
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
@@ -49,10 +49,14 @@ AI_OUTPUT_TOKEN_BUDGET = int(os.getenv("AI_OUTPUT_TOKEN_BUDGET", "3000"))
 # The app can charge a different price/fee: never promise an executable profit.
 ROUND_TRIP_FEE_PCT = float(os.getenv("ROUND_TRIP_FEE_PCT", "1.00"))
 EXECUTION_BUFFER_PCT = float(os.getenv("EXECUTION_BUFFER_PCT", "0.30"))
-MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "0.75"))
-MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "3.00"))
+MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "2.00"))
+MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "6.00"))
 MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
+MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
+MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
+STOP_ATR_MULTIPLE = float(os.getenv("STOP_ATR_MULTIPLE", "2.25"))
 # Swing candidates are silent until validated by the same net-gain and CDC gates.
 SWING_ENABLED = os.getenv("SWING_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
 SWING_MIN_AGE_MIN = float(os.getenv("SWING_MIN_AGE_MIN", "8"))
@@ -1221,8 +1225,8 @@ def ai_review_batch(candidates):
         "Déclasse si le volume retombe fortement, si le mouvement paraît déjà consommé, si le spread/liquidité est faible, "
         "ou si le ratio rendement/risque n'est pas propre. "
         "Le coût estimé aller-retour est de 1,30% (frais, spread et exécution). "
-        "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 0,75% net, "
-        "TP2 au moins 3,0% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
+        "N'indique TRADE que si, APRES ces coûts, TP1 offre au moins 2% net, "
+        "TP2 au moins 6% net et si le rapport gain net TP2 / perte potentielle coûts inclus dépasse 2. "
         "Ne gonfle JAMAIS les objectifs pour contourner ce filtre: WAIT si les données ne justifient pas un tel potentiel. "
         "Pour TRADE seulement, fournis une zone d'entrée autour du prix actuel, une invalidation sous l'entrée, "
         "et TP1/TP2 au-dessus. Les niveaux doivent être cohérents avec un trade court terme, pas des objectifs fantaisistes. "
