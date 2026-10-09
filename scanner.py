@@ -833,8 +833,6 @@ def cleanup_expired_pilots(now: float):
         p = pilots.pop(pair)
         if _state_db is not None:
             _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
-        if _state_db is not None:
-            _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
         ai_next_review_at.pop(pair, None)
         print(
             f"PILOTE EXPIRE — {pair} | age={((now - p.created_at) / 60):.0f}m | "
@@ -1475,47 +1473,34 @@ def run():
                 if action:
                     print(f"POSITION ACTION — {held_pair} | {action} | prix={held_price:.10g}", flush=True)
 
+            # V5: MARKET COVERAGE BEFORE scoring. Previously almost every coin
+            # was discarded on a 24h rolling-volume delta before requesting 1m data.
+            # Evaluate a full market rotation plus active pilots and fresh movers.
+            chosen = v5_choose_candle_pairs(tickers)
+            fresh_candles = v5_load_candles(chosen, now)
             raw_signals = []
-            signal_by_pair = {}
-            for pair in list(history.keys()):
-                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
-                sig = score_signal(pair, gate24)
-                if not sig:
-                    continue
-                raw_signals.append(sig)
-                signal_by_pair[pair] = sig
-
-            raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
-            early_count = len(raw_signals)
-            # Enrich only a budgeted subset with actual 1-minute traded volume.
-            # Run the enrichment before trajectory confirmations and AI.
-            to_enrich = raw_signals[:CANDLE_ENRICH_PER_SCAN//2]
-            for sig in to_enrich:
-                metrics = cdc_candle_metrics(sig.pair, now)
-                if metrics:
-                    sig.vol_ratio = metrics["volume_ratio"]
-                    sig.ret_5m = metrics["r5"]
-                    sig.ret_15m = metrics["r15"]
-            cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
-
-            # Multi-pass follow-up is independent from the initial anomaly trigger.
-            # Every live pilot gets a tracking score each cycle, even when vol_ratio
-            # has cooled below EARLY_MIN_VOLUME_RATIO.
             tracked_signals = []
-            for pair in list(pilots.keys()):
-                if pair in positions or pair in signal_by_pair or pair not in history:
+            for pair, candle in fresh_candles.items():
+                if pair in positions or pair not in by_pair:
                     continue
-                gate24 = fnum(by_pair.get(pair, {}).get("change_percentage"))
-                sig = score_signal(pair, gate24, tracking=True)
+                gate24 = fnum(by_pair[pair].get("change_percentage"))
+                is_tracking = pair in pilots
+                sig = score_signal(pair, gate24, tracking=is_tracking, metrics=candle)
                 if sig:
-                    tracked_signals.append(sig)
-
-            for sig in sorted(tracked_signals, key=lambda x: (x.score, x.ret_5m), reverse=True)[:CANDLE_ENRICH_PER_SCAN//2]:
-                metrics = cdc_candle_metrics(sig.pair, now)
-                if metrics:
-                    sig.vol_ratio = metrics["volume_ratio"]
-                    sig.ret_5m = metrics["r5"]
-                    sig.ret_15m = metrics["r15"]
+                    if is_tracking:
+                        tracked_signals.append(sig)
+                    else:
+                        raw_signals.append(sig)
+            raw_signals.sort(key=lambda x: (x.score,x.vol_ratio), reverse=True)
+            tracked_signals.sort(key=lambda x: (x.score,x.vol_ratio),reverse=True)
+            early_count = len(raw_signals)
+            cdc_count = sum(1 for sig in raw_signals if cdc_tradeable(sig.pair))
+            print(
+                f"V5 DONNEES — actifs={len(tickers)} | bougies demandées={len(chosen)} "
+                f"| bougies fraîches={len(fresh_candles)} | sans bougies={len(chosen)-len(fresh_candles)} "
+                f"| nouveaux candidats={len(raw_signals)} | suivis actifs réévalués={len(tracked_signals)}",
+                flush=True
+            )
             gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
@@ -1722,6 +1707,33 @@ def pepito_selftest():
         assert not continuation_ok(falling,p_strk,18,2.0)
         assert PILOT_TTL_MIN >= 24*60
 
+        # V5: candle-first detection must not need a rising 24h volume counter.
+        # A freshly listed market with 2 observations is eligible via real 1m candles.
+        vp="V5FRESH_USDT"; history[vp].clear()
+        for i in range(2):
+            history[vp].append(Snapshot(now-60+i*60, 1.0+i*0.0001,
+                                        500_000, 0.9999, 1.0002))
+        real_candles = {
+            "volume_ratio":18.0, "volume_1m_usd_est":2100,
+            "r1":0.14,"r5":0.45,"r15":0.65,"age_sec":30
+        }
+        new_sig=score_signal(vp,0.0,metrics=real_candles)
+        assert new_sig is not None and new_sig.vol_ratio==18.0
+        assert new_sig.ret_5m==0.45
+        assert excluded_pair("USDT_USDT") and excluded_pair("USD_USDT")
+        pair_list = v5_choose_candle_pairs([{
+            "currency_pair":"OGN_USDT", "quote_volume":500000,
+            "change_percentage":2.0
+        },{
+            "currency_pair":"RLC_USDT","quote_volume":500000,
+            "change_percentage":1.0
+        },{
+            "currency_pair":"USDT_USDT","quote_volume":900000,
+            "change_percentage":0.0
+        }])
+        assert set(pair_list)=={"OGN_USDT","RLC_USDT"}, pair_list
+        history.pop(vp,None)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1765,7 +1777,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
