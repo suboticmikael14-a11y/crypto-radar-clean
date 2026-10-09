@@ -14,9 +14,11 @@ import requests
 GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
 GATE_CANDLES_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 CDC_INSTRUMENTS_URL = "https://api.crypto.com/exchange/v1/public/get-instruments"
+CDC_TICKERS_URL = "https://api.crypto.com/exchange/v1/public/get-tickers"
+CDC_CANDLES_URL = "https://api.crypto.com/exchange/v1/public/get-candlestick"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
-MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "200000"))
+MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "150000"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -59,7 +61,7 @@ SWING_MIN_SPIKE_RATIO = float(os.getenv("SWING_MIN_SPIKE_RATIO", "8"))
 
 
 # V2 — suivi de trajectoire après la première détection pilote.
-PILOT_TTL_MIN = int(os.getenv("PILOT_TTL_MIN", "180"))
+PILOT_TTL_MIN = int(os.getenv("PILOT_TTL_MIN", "10080"))
 MAX_PILOT_24H = float(os.getenv("MAX_PILOT_24H", "10"))
 CONFIRM_MIN_AGE_SEC = int(os.getenv("CONFIRM_MIN_AGE_SEC", "55"))
 CONFIRM_MIN_PRICE_GAIN = float(os.getenv("CONFIRM_MIN_PRICE_GAIN", "0.30"))
@@ -88,6 +90,14 @@ slack_blocked_until = 0.0
 last_slack_send_at = 0.0
 ai_next_review_at = {}
 cdc_pairs = set()
+cdc_market_by_base = {}
+cdc_ticker_by_pair = {}
+gate_aux_history = defaultdict(lambda: deque(maxlen=50))
+candle_cache = {}
+CANDLE_ENRICH_PER_SCAN = int(os.getenv("CANDLE_ENRICH_PER_SCAN", "18"))
+CANDLE_MIN_FRESH_SEC = int(os.getenv("CANDLE_MIN_FRESH_SEC", "140"))
+V4_BACKTEST_MODE = os.getenv("PEPITO_SELFTEST", "0").lower() in {"1","true","yes","on"}
+
 cdc_pairs_updated_at = 0.0
 positions = {}
 gate_rejections = Counter()
@@ -191,44 +201,56 @@ def commit_state(now):
         _state_db.commit()
 
 def gate_historical_context(pair, now):
-    """Compact 6h/24h/7d context from Gate hourly candles; fetched only for candidates."""
+    """6h/24h/7d spot context from the actual Crypto.com Exchange instrument.
+    Gate is supplementary for early detection, never the source of executable prices.
+    """
+    market = cdc_ticker_by_pair.get(pair)
+    if not market or not market.get("exchange_symbol"):
+        return {}
     try:
-        r = session.get(GATE_CANDLES_URL, params={"currency_pair": pair, "interval": "1h", "limit": 168}, timeout=HTTP_TIMEOUT)
+        r = session.get(CDC_CANDLES_URL, params={
+            "instrument_name": market["exchange_symbol"], "timeframe": "1h",
+            "count": 170
+        }, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
-        candles = r.json()
-        parsed = []
-        for row in candles if isinstance(candles, list) else []:
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            ts = int(float(row[0]))
-            close = fnum(row[2])
-            high = fnum(row[3])
-            low = fnum(row[4])
-            quote_vol = fnum(row[1])
-            if ts > 0 and close > 0:
-                hi = max(close, high) if high > 0 else close
-                lo = min(close, low) if low > 0 else close
-                parsed.append((ts, close, quote_vol, hi, lo))
-        parsed.sort(key=lambda x: x[0])
-        if not parsed:
+        payload = r.json()
+        if payload.get("code") != 0:
             return {}
-        current = parsed[-1][1]
+        rows = sorted(payload.get("result", {}).get("data", []),
+                      key=lambda x: fnum(x.get("t")))
+        parsed = []
+        for c in rows:
+            ts = fnum(c.get("t")) / 1000.0
+            close = fnum(c.get("c"))
+            high = fnum(c.get("h"))
+            low = fnum(c.get("l"))
+            vol = fnum(c.get("v"))
+            if ts > 0 and close > 0 and high > 0 and low > 0 and ts <= now:
+                parsed.append((ts, close, vol*close, high, low))
+        if len(parsed) < 2:
+            return {}
+        current = fnum(market.get("last")) or parsed[-1][1]
         out = {}
-        for label, sec in (("6h",21600),("24h",86400),("7d",604800)):
-            eligible = [x for x in parsed if x[0] <= now-sec]
-            if eligible:
-                x = eligible[-1]
-                window = [r for r in parsed if r[0] >= now-sec]
-                high = max((r[3] for r in window), default=current)
-                low = min((r[4] for r in window), default=current)
-                out[label] = {"price": x[1], "return_pct": pct(current, x[1]),
-                              "hour_quote_volume": x[2], "source": "gate_1h",
-                              "high": high, "low": low,
-                              "range_pct": ((high-low)/low*100) if low > 0 else 0.0}
+        for label, sec in (("6h", 21600), ("24h", 86400), ("7d", 604800)):
+            window = [x for x in parsed if x[0] >= now-sec]
+            old = [x for x in parsed if x[0] <= now-sec]
+            if len(window) < 2:
+                continue
+            hi = max(x[3] for x in window)
+            lo = min(x[4] for x in window)
+            comparison = old[-1][1] if old else window[0][1]
+            out[label] = {
+                "price": comparison, "return_pct": pct(current, comparison),
+                "hour_quote_volume": window[-1][2],
+                "source": "crypto_com_exchange_spot_1h",
+                "high": hi, "low": lo,
+                "range_pct": (hi/lo-1)*100 if lo>0 else 0
+            }
         return out
     except Exception as exc:
-        print(f"PEPITO CONTEXTE ERREUR — {pair} | {type(exc).__name__}: {exc}", flush=True)
+        print(f"V4 CONTEXTE CDC INDISPONIBLE — {pair} | {type(exc).__name__}: {exc}", flush=True)
         return {}
+
 
 def persistent_context(pair, now):
     if _state_db is not None:
@@ -436,13 +458,138 @@ def cdc_tradeable(pair: str) -> bool:
     return any(x in cdc_pairs for x in (f"{base}_USD", f"{base}_USDT", f"{base}-USD", f"{base}-USDT"))
 
 
-def fetch_tickers():
-    r = session.get(GATE_TICKERS_URL, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
+def normalize_cdc_tickers(payload, allowed, now=None):
+    """One executable quote per coin. SPOT whitelist is authoritative, never futures."""
+    now = time.time() if now is None else now
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        raise RuntimeError("Crypto.com Exchange tickers indisponibles")
+    data = payload.get("result", {}).get("data", [])
     if not isinstance(data, list):
-        raise RuntimeError("Réponse Gate.io inattendue")
-    return data
+        raise RuntimeError("Crypto.com Exchange tickers invalides")
+    by_base = {}
+    for x in data:
+        name = str(x.get("i", "")).upper()
+        if name not in allowed or "_" not in name:
+            continue
+        base, quote = name.rsplit("_", 1)
+        if not base or quote not in {"USD", "USDT"} or base in EXCLUDED_BASES:
+            continue
+        price, bid, ask = fnum(x.get("a")), fnum(x.get("b")), fnum(x.get("k"))
+        dollar_volume = fnum(x.get("vv"))
+        published = fnum(x.get("t")) / 1000.0
+        if not (price > 0 and bid > 0 and ask >= bid and dollar_volume > 0):
+            continue
+        if published > 0 and abs(now - published) > 240:
+            continue
+        old = by_base.get(base)
+        # Prefer genuinely more liquid CDC execution market; USD and USDT are both eligible.
+        if old is None or dollar_volume > old[0]:
+            by_base[base] = (dollar_volume, {
+                "currency_pair": f"{base}_USDT", "exchange_symbol": name,
+                "last": price, "highest_bid": bid, "lowest_ask": ask,
+                "quote_volume": dollar_volume, "change_percentage": fnum(x.get("c")) * 100,
+                "published": published,
+            })
+    return [entry for _, entry in by_base.values()]
+
+
+def fetch_tickers():
+    """Crypto.com Exchange SPOT is the primary universe, Gate.io auxiliary only."""
+    global cdc_ticker_by_pair
+    refresh_cdc_pairs()
+    r = session.get(CDC_TICKERS_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    result = normalize_cdc_tickers(r.json(), cdc_pairs)
+    if not result:
+        raise RuntimeError("Aucun ticker Spot Crypto.com; refus de trader")
+    cdc_ticker_by_pair = {t["currency_pair"]: t for t in result}
+    # Auxiliary Gate feed never invents missing CDC tradability or substitutes a stale
+    # Gate price for an executable Exchange quote.
+    try:
+        gr = session.get(GATE_TICKERS_URL, timeout=HTTP_TIMEOUT)
+        gr.raise_for_status()
+        gate = gr.json()
+        gate_now = time.time()
+        available = cdc_ticker_by_pair
+        if isinstance(gate, list):
+            for t in gate:
+                pair = str(t.get("currency_pair", "")).upper()
+                if pair not in available:
+                    continue
+                price = fnum(t.get("last"))
+                volume = fnum(t.get("quote_volume"))
+                if price <= 0 or volume <= 0:
+                    continue
+                cdcp = fnum(available[pair]["last"])
+                if cdcp <= 0 or abs(price / cdcp - 1.0) > 0.05:
+                    continue
+                gate_aux_history[pair].append(Snapshot(gate_now, price, volume,
+                    fnum(t.get("highest_bid")), fnum(t.get("lowest_ask"))))
+    except Exception as exc:
+        print(f"GATE AUX INDISPONIBLE — CDC reste prioritaire | {type(exc).__name__}", flush=True)
+    print(f"V4 COUVERTURE — {len(cdc_pairs)} paires Spot whitelist | "
+          f"{len(result)} actifs CDC cotés | Gate auxiliaire {len(gate_aux_history)} suivis", flush=True)
+    return result
+
+
+def cdc_candle_metrics(pair, now=None):
+    """Real closed 1m candle volume, never pretend rolling 24h delta = 1m volume."""
+    now = time.time() if now is None else now
+    cached = candle_cache.get(pair)
+    item = cdc_ticker_by_pair.get(pair)
+    if not item:
+        return None
+    instrument = item.get("exchange_symbol")
+    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument:
+        return cached[1]
+    try:
+        r = session.get(CDC_CANDLES_URL, params={
+            "instrument_name": instrument, "timeframe": "1m", "count": 45
+        }, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != 0:
+            return None
+        rows = sorted(data.get("result", {}).get("data", []), key=lambda x: int(x.get("t",0)))
+        closed = [x for x in rows if fnum(x.get("t")) / 1000.0 + 60 <= now
+                  and fnum(x.get("c")) > 0 and fnum(x.get("v")) >= 0]
+        if len(closed) < 23 or (now - fnum(closed[-1]["t"])/1000.0 > CANDLE_MIN_FRESH_SEC + 60):
+            return None
+        values = [fnum(x["v"]) * fnum(x["c"]) for x in closed]
+        base = statistics.median(values[-21:-1])
+        # When median is zero, a real new burst should not vanish.
+        # Compare to a conservative 24h hourly-rate reference instead.
+        if base > 0:
+            ratio = values[-1] / base
+        else:
+            fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
+            ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
+        closes = [fnum(x["c"]) for x in closed]
+        metrics = {
+            "volume_ratio": ratio, "r5": pct(closes[-1], closes[-6]),
+            "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
+            "volume_1m_usd_est": values[-1], "age_sec": now - fnum(closed[-1]["t"]) / 1000.0 - 60,
+            "high_45m": max(fnum(x.get("h")) for x in closed[-40:]),
+            "low_45m": min(fnum(x.get("l")) for x in closed[-40:]),
+            "symbol": instrument
+        }
+        candle_cache[pair] = (now, metrics)
+        return metrics
+    except Exception as exc:
+        print(f"CDC CANDLES ATTENTE — {pair} | {type(exc).__name__}", flush=True)
+        return None
+
+
+def gate_volume_ratio(pair):
+    samples = gate_aux_history.get(pair)
+    if not samples or len(samples) < 8:
+        return 0.0
+    deltas = minute_volume_deltas(samples)
+    if len(deltas) < 6:
+        return 0.0
+    baseline = statistics.median(deltas[:-1][-20:])
+    latest = max(0.0, samples[-1].qv24 - samples[-2].qv24)
+    return latest / baseline if baseline > 0 else 0.0
 
 
 def add_snapshot(ticker, now):
@@ -516,18 +663,18 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     baseline = statistics.median(baseline_pool) if baseline_pool else 0.0
     if baseline <= 0:
         return None
-    vol_ratio = current_delta / baseline
+    vol_ratio = max(current_delta / baseline, gate_volume_ratio(pair))
 
     # Détection pré-mouvement: volume anormal + début de momentum,
     # sans accepter une bougie déjà partie de façon extrême à très court terme.
     # A new candidate must cross the early trigger. An existing pilot is different:
     # keep measuring its trajectory even after the anomaly cools down, otherwise
     # TRACKED pilots become dead memory and can never prove continuation/failure.
-    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO:
+    if not tracking and vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
         return None
     if ret1 < -0.35 or ret5 < -0.75:
         return None
-    if ret5 > EARLY_MAX_RET5 or ret15 > 10.0:
+    if not tracking and (ret5 > EARLY_MAX_RET5 or ret15 > 10.0):
         return None
 
     # PEPITO scoring verrouillé: 30/20/15/15/10/10.
@@ -548,13 +695,13 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     score = min(100, round(100 * (volume_pts + flow_pts + liquidity_pts + unextended_pts + structure_pts) / 90))
 
     # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
-    if change24h > 15.0 or ret15 > 6.0:
+    if not tracking and (change24h >= 20.0 or ret15 > 9.0):
         return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
-    if not tracking and score < early_score_floor:
+    if not tracking and score < early_score_floor and ret5 < 0.65:
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
@@ -661,6 +808,20 @@ def swing_accumulation_ok(sig: Signal, pilot: PilotState, age_min: float, price_
     return spikes >= SWING_MIN_RECENT_SPIKES
 
 
+def continuation_ok(sig, pilot, age_min, price_gain):
+    """STRK-style continuation: early volume memory matters after 1m volume cools."""
+    if pilot.sightings < 3 or age_min < 2 or age_min > PILOT_TTL_MIN:
+        return False
+    if not (0.30 <= price_gain <= 12.0 and sig.score >= 38
+            and pilot.best_score >= 60 and pilot.best_vol_ratio >= 5.0):
+        return False
+    if not (0.35 <= sig.ret_5m <= 3.0 and 0.55 <= sig.ret_15m <= 6.0):
+        return False
+    if sig.spread_pct > 0.20 or sig.change_24h > 22.0:
+        return False
+    return True
+
+
 def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]:
     if not can_alert(sig.pair, now):
         return None
@@ -758,6 +919,11 @@ def evaluate_trajectory(sig: Signal, now: float) -> Optional[ConfirmedCandidate]
             age_min=age_min,
         )
 
+    if continuation_ok(sig, pilot, age_min, price_gain):
+        print(f"V4 CONTINUATION — {sig.pair} | gain depuis pilote {price_gain:+.2f}% "
+              f"meilleur score={pilot.best_score} | controle AI/CDC/frais requis", flush=True)
+        return ConfirmedCandidate(signal=sig, pilot=pilot, price_gain=price_gain,
+                                  age_min=age_min, style="CONTINUATION")
     if swing_accumulation_ok(sig, pilot, age_min, price_gain):
         print(f"SWING ACCUMULATION CANDIDATE — {sig.pair} | age={age_min:.0f}m | "
               f"vol=x{sig.vol_ratio:.1f} | r5={sig.ret_5m:+.2f}% | "
@@ -836,7 +1002,9 @@ def _candidate_payload(c: ConfirmedCandidate):
     return {
         "pair": s.pair,
         "setup_style": c.style,
-        "time_horizon": "1-7 days" if c.style == "SWING_ACCUMULATION" else "30m-6h",
+        "time_horizon": "1-7 days" if c.style == "SWING_ACCUMULATION" else "1h-48h" if c.style == "CONTINUATION" else "30m-6h",
+        "exchange_instrument": cdc_ticker_by_pair.get(s.pair, {}).get("exchange_symbol", ""),
+        "exchange_candle_metrics": candle_cache.get(s.pair, (None, {}))[1],
         "score": s.score,
         "price": s.price,
         "pilot_price": p.first_price,
@@ -911,7 +1079,9 @@ def ai_review_batch(candidates):
 
     system_prompt = (
         "Tu es la couche finale de filtrage d'un radar crypto haussier. "
-        "Analyse deux profils: MOMENTUM (30 min-6 heures) et SWING_ACCUMULATION (1-7 jours). "
+        "Analyse trois profils: MOMENTUM (30 min-6 heures), SWING_ACCUMULATION (1-7 jours) "
+        "et CONTINUATION (1h-48h): le volume d'origine peut retomber après un déclenchement "
+        "historique important, sans annuler une hausse confirmée. "
         "Un SWING_ACCUMULATION peut accumuler des volumes anormaux alors que les retours 5m/15m "
         "sont encore faibles: ne le rejette pas pour cette seule raison. "
         "Pour SWING_ACCUMULATION, lis les prix hauts/bas et amplitudes des horizons "
@@ -1053,18 +1223,38 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         )
         return False
 
-    if c.age_min > AI_MAX_SIGNAL_AGE_MIN or c.price_gain > AI_MAX_PRICE_GAIN:
+    if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
         return False
+    if c.price_gain > (12.0 if c.style == "CONTINUATION" else
+                       2.5 if c.style == "SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN):
+        return False
+    if not V4_BACKTEST_MODE:
+        x = cdc_ticker_by_pair.get(c.signal.pair)
+        if not x or not cdc_tradeable(c.signal.pair):
+            return False
+        # Recent Exchange-native candle and a live executable quote are mandatory.
+        m = cdc_candle_metrics(c.signal.pair)
+        if not m or m["age_sec"] > CANDLE_MIN_FRESH_SEC:
+            return False
+        # No apparent momentum is tradable on zero CDC execution volume.
+        if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
+            return False
+        if m["volume_ratio"] < 1.2 and m["r5"] < 0.25:
+            return False
+        if abs(c.signal.price / fnum(x["last"]) - 1.0) > 0.003:
+            return False
+    return True
     return True
 
 
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
     return (
-        f"TRADE EXPLOITABLE MAINTENANT — CONFIRMATION/RENFORCEMENT\n"
+        f"TRADE EXPLOITABLE — NOUVELLE ENTRÉE À VALIDER\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
-        f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '30m-6h'}\n"
+        f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
+        f"Marché de référence : {cdc_ticker_by_pair.get(s.pair, {}).get('exchange_symbol','Crypto.com Exchange')}\n"
         f"Prix actuel : {s.price:.10g}\n"
         f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
         f"Invalidation : {review.invalidation:.10g}\n"
@@ -1191,6 +1381,15 @@ def run():
 
             raw_signals.sort(key=lambda x: (x.score, x.vol_ratio), reverse=True)
             early_count = len(raw_signals)
+            # Enrich only a budgeted subset with actual 1-minute traded volume.
+            # Run the enrichment before trajectory confirmations and AI.
+            to_enrich = raw_signals[:CANDLE_ENRICH_PER_SCAN//2]
+            for sig in to_enrich:
+                metrics = cdc_candle_metrics(sig.pair, now)
+                if metrics:
+                    sig.vol_ratio = metrics["volume_ratio"]
+                    sig.ret_5m = metrics["r5"]
+                    sig.ret_15m = metrics["r15"]
             cdc_count = sum(1 for s in raw_signals if cdc_tradeable(s.pair))
 
             # Multi-pass follow-up is independent from the initial anomaly trigger.
@@ -1205,6 +1404,12 @@ def run():
                 if sig:
                     tracked_signals.append(sig)
 
+            for sig in sorted(tracked_signals, key=lambda x: (x.score, x.ret_5m), reverse=True)[:CANDLE_ENRICH_PER_SCAN//2]:
+                metrics = cdc_candle_metrics(sig.pair, now)
+                if metrics:
+                    sig.vol_ratio = metrics["volume_ratio"]
+                    sig.ret_5m = metrics["r5"]
+                    sig.ret_15m = metrics["r15"]
             gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
@@ -1215,7 +1420,8 @@ def run():
                     confirmed.append(candidate)
 
             confirmed.sort(
-                key=lambda c: (c.signal.score, -c.price_gain, c.signal.qv24, c.signal.vol_ratio),
+                key=lambda c: (c.style in {"CONTINUATION","SWING_ACCUMULATION"},
+                               c.signal.score, -c.price_gain, c.signal.qv24, c.signal.vol_ratio),
                 reverse=True,
             )
 
@@ -1224,7 +1430,7 @@ def run():
             due = []
             for c in confirmed:
                 pair = c.signal.pair
-                if c.age_min > AI_MAX_SIGNAL_AGE_MIN:
+                if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
                     print(
                         f"AI IGNORE — {pair} trop ancien | age={c.age_min:.0f}m > {AI_MAX_SIGNAL_AGE_MIN}m",
                         flush=True,
@@ -1232,7 +1438,8 @@ def run():
                     pilots.pop(pair, None)
                     ai_next_review_at.pop(pair, None)
                     continue
-                if c.price_gain > AI_MAX_PRICE_GAIN:
+                if c.price_gain > (12.0 if c.style == "CONTINUATION" else
+                                   2.5 if c.style == "SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN):
                     print(
                         f"AI IGNORE — {pair} mouvement déjà trop étendu depuis pilote | "
                         f"gain={c.price_gain:+.2f}% > {AI_MAX_PRICE_GAIN:.2f}%",
@@ -1386,6 +1593,29 @@ def pepito_selftest():
         assert not validate_trade_review(
             AIReview("MET_USDT","TRADE",90,"weak",1.004,1.006,0.99,1.015,1.02),cc)
 
+        # V4: official instrument universe / liquidity / synthetic OGN+RLC coverage.
+        mock = {"code":0, "result":{"data":[
+            {"i":"OGN_USD","a":"0.027","b":"0.0269","k":"0.0271","vv":"360000","c":"0.16"},
+            {"i":"STRK_USDT","a":"0.05","b":"0.0499","k":"0.0501","vv":"540000","c":"0.06"},
+            {"i":"RLC_USD","a":"0.7","b":"0.699","k":"0.701","vv":"680000","c":"0.05"},
+            {"i":"CROCAT_USD","a":"1","b":"0.9","k":"1.1","vv":"90000","c":"0.6"},
+            {"i":"FAKEUSD-PERP","a":"1","b":"1","k":"1","vv":"999999","c":"0.6"}
+        ]}}
+        normalized = normalize_cdc_tickers(mock, {"OGN_USD","STRK_USDT","RLC_USD"}, now)
+        assert {t["currency_pair"] for t in normalized} == {"OGN_USDT","STRK_USDT","RLC_USDT"}
+        assert next(t for t in normalized if t["currency_pair"] == "OGN_USDT")["exchange_symbol"] == "OGN_USD"
+        p_strk=PilotState(now-18*60, now, 0.04988, 81, 7.9, 0,0,0,0,
+                          sightings=15,best_score=93,best_vol_ratio=34.6,
+                          best_price=0.0505,min_price=0.0498,last_price=0.0504,
+                          last_score=61,last_vol_ratio=1.4,trajectory=deque(maxlen=90))
+        continuing=synthetic_signal(pair="STRK_USDT",price=0.05045,score=61,
+                                    vol=1.4,r1=0.1,r5=0.8,r15=1.2,change24=2.0)
+        assert continuation_ok(continuing,p_strk,18,1.14)
+        falling=synthetic_signal(pair="RLC_USDT",price=0.67,score=65,
+                                 vol=2.2,r1=-0.4,r5=-1.3,r15=-3.0,change24=-12.0)
+        assert not continuation_ok(falling,p_strk,18,2.0)
+        assert PILOT_TTL_MIN >= 24*60
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1429,7 +1659,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
@@ -1439,8 +1669,31 @@ def pepito_selftest():
         history.pop("SELFACCEL_USDT", None)
 
 
+
+def pepito_integration_test():
+    """Read-only real data verification: never sends Slack or places any orders."""
+    refresh_cdc_pairs()
+    all_tickers = fetch_tickers()
+    assert len(all_tickers) >= 100, "CDC market coverage unexpectedly low"
+    checked = []
+    for asset in ("OGN", "STRK", "RLC"):
+        pair = asset + "_USDT"
+        item = cdc_ticker_by_pair.get(pair)
+        assert item, f"Exchange ticker missing: {asset}"
+        candle = cdc_candle_metrics(pair)
+        assert candle and candle["volume_1m_usd_est"] >= 0, f"1m candles missing: {asset}"
+        context = gate_historical_context(pair, time.time())
+        assert context, f"6h/24h context missing: {asset}"
+        checked.append(f"{asset}={item['exchange_symbol']} 1m_vol={candle['volume_1m_usd_est']:.0f} "
+                       f"r5={candle['r5']:+.2f}% c6h={context.get('6h',{}).get('return_pct','NA')}")
+    print("PEPITO V4 LIVE INTEGRATION — PASS | Spot catalog="+str(len(cdc_pairs))
+          +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
+
+
 if __name__ == "__main__":
-    if os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
+    if os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
+        pepito_integration_test()
+    elif os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
         pepito_selftest()
     else:
         run()
