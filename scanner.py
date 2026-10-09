@@ -41,6 +41,7 @@ AI_ERROR_COOLDOWN_MIN = int(os.getenv("AI_ERROR_COOLDOWN_MIN", "3"))
 AI_MAX_SIGNAL_AGE_MIN = int(os.getenv("AI_MAX_SIGNAL_AGE_MIN", "90"))
 AI_MAX_PRICE_GAIN = float(os.getenv("AI_MAX_PRICE_GAIN", "4.0"))
 AI_HTTP_TIMEOUT = int(os.getenv("AI_HTTP_TIMEOUT", "35"))
+AI_OUTPUT_TOKEN_BUDGET = int(os.getenv("AI_OUTPUT_TOKEN_BUDGET", "3000"))
 # Strict net-exploitability gate. Conservative default for base Crypto.com
 # Exchange spot taker trades (0.50% buy + 0.50% sell), plus execution buffer.
 # The app can charge a different price/fee: never promise an executable profit.
@@ -1131,7 +1132,7 @@ def ai_review_batch(candidates):
                 "schema": schema,
             }
         },
-        "max_output_tokens": 900,
+        "max_output_tokens": AI_OUTPUT_TOKEN_BUDGET,
     }
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -1148,9 +1149,15 @@ def ai_review_batch(candidates):
             body = (r.text or "")[:300].replace(chr(10), " ")
             print(f"AI HTTP {r.status_code} — {body}", flush=True)
             return None
-        raw = _response_text(r.json())
+        payload_response = r.json()
+        raw = _response_text(payload_response)
         if not raw:
-            print("AI ERREUR — réponse vide", flush=True)
+            diagnostic = payload_response.get("incomplete_details") or {}
+            usage = payload_response.get("usage") or {}
+            print(f"AI ERREUR — réponse vide | status={payload_response.get('status')} "
+                  f"incomplete_reason={diagnostic.get('reason')} "
+                  f"output_tokens={usage.get('output_tokens')} "
+                  f"budget={AI_OUTPUT_TOKEN_BUDGET}", flush=True)
             return None
         parsed = json.loads(raw)
     except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
@@ -1593,6 +1600,7 @@ def pepito_selftest():
         assert not validate_trade_review(
             AIReview("MET_USDT","TRADE",90,"weak",1.004,1.006,0.99,1.015,1.02),cc)
 
+        assert AI_OUTPUT_TOKEN_BUDGET >= 2000
         # V4: official instrument universe / liquidity / synthetic OGN+RLC coverage.
         mock = {"code":0, "result":{"data":[
             {"i":"OGN_USD","a":"0.027","b":"0.0269","k":"0.0271","vv":"360000","c":"0.16"},
