@@ -536,12 +536,12 @@ def cdc_candle_metrics(pair, now=None):
     """Real closed 1m candle volume, never pretend rolling 24h delta = 1m volume."""
     now = time.time() if now is None else now
     cached = candle_cache.get(pair)
-    if cached and now - cached[0] < 75:
-        return cached[1]
     item = cdc_ticker_by_pair.get(pair)
     if not item:
         return None
     instrument = item.get("exchange_symbol")
+    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument:
+        return cached[1]
     try:
         r = session.get(CDC_CANDLES_URL, params={
             "instrument_name": instrument, "timeframe": "1m", "count": 45
@@ -557,7 +557,13 @@ def cdc_candle_metrics(pair, now=None):
             return None
         values = [fnum(x["v"]) * fnum(x["c"]) for x in closed]
         base = statistics.median(values[-21:-1])
-        ratio = values[-1] / base if base > 0 else 0.0
+        # When median is zero, a real new burst should not vanish.
+        # Compare to a conservative 24h hourly-rate reference instead.
+        if base > 0:
+            ratio = values[-1] / base
+        else:
+            fallback = max(50.0, fnum(item.get("quote_volume")) / 1440.0 * 0.15)
+            ratio = values[-1] / fallback if values[-1] >= 250.0 else 0.0
         closes = [fnum(x["c"]) for x in closed]
         metrics = {
             "volume_ratio": ratio, "r5": pct(closes[-1], closes[-6]),
@@ -1230,6 +1236,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         m = cdc_candle_metrics(c.signal.pair)
         if not m or m["age_sec"] > CANDLE_MIN_FRESH_SEC:
             return False
+        # No apparent momentum is tradable on zero CDC execution volume.
+        if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
+            return False
         if m["volume_ratio"] < 1.2 and m["r5"] < 0.25:
             return False
         if abs(c.signal.price / fnum(x["last"]) - 1.0) > 0.003:
@@ -1241,7 +1250,7 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
     return (
-        f"TRADE EXPLOITABLE MAINTENANT — CONFIRMATION/RENFORCEMENT\n"
+        f"TRADE EXPLOITABLE — NOUVELLE ENTRÉE À VALIDER\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
         f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
