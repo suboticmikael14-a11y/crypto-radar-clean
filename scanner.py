@@ -57,6 +57,10 @@ MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
 MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
 MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
 STOP_ATR_MULTIPLE = float(os.getenv("STOP_ATR_MULTIPLE", "2.25"))
+MIN_FINAL_AI_CONFIDENCE = int(os.getenv("MIN_FINAL_AI_CONFIDENCE", "78"))
+MIN_FINAL_SIGNAL_SCORE = int(os.getenv("MIN_FINAL_SIGNAL_SCORE", "60"))
+MIN_FINAL_RET5_PCT = float(os.getenv("MIN_FINAL_RET5_PCT", "0.25"))
+MIN_FINAL_RET15_PCT = float(os.getenv("MIN_FINAL_RET15_PCT", "0.45"))
 # Swing candidates are silent until validated by the same net-gain and CDC gates.
 SWING_ENABLED = os.getenv("SWING_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
 SWING_MIN_AGE_MIN = float(os.getenv("SWING_MIN_AGE_MIN", "8"))
@@ -1222,8 +1226,10 @@ def ai_review_batch(candidates):
         "Analyse trois profils: MOMENTUM (30 min-6 heures), SWING_ACCUMULATION (1-7 jours) "
         "et CONTINUATION (1h-48h): le volume d'origine peut retomber après un déclenchement "
         "historique important, sans annuler une hausse confirmée. "
-        "Un SWING_ACCUMULATION peut accumuler des volumes anormaux alors que les retours 5m/15m "
-        "sont encore faibles: ne le rejette pas pour cette seule raison. "
+        "Un SWING_ACCUMULATION peut être surveillé silencieusement lorsque ses retours 5m/15m "
+        "sont encore faibles, mais aucun TRADE ne doit être proposé avant une vraie réaccélération. "
+        "Au moment du TRADE, exige une confiance d'au moins 78/100, un score de marché >=60, "
+        "une progression >=0,25% sur 5m et >=0,45% sur 15m. "
         "Pour SWING_ACCUMULATION, lis les prix hauts/bas et amplitudes des horizons "
         "6h/24h/7j dans persistent_context et refuse les objectifs incompatibles. "
         "et exige un potentiel de continuation justifié par les données fournies. "
@@ -1347,8 +1353,16 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
     if review.decision != "TRADE":
         return deny("ai_not_trade")
-    if review.confidence < 70:
-        return deny("ai_confidence", f"value={review.confidence}")
+    if review.confidence < MIN_FINAL_AI_CONFIDENCE:
+        return deny("ai_confidence",f"value={review.confidence} min={MIN_FINAL_AI_CONFIDENCE}")
+    if c.signal.score < MIN_FINAL_SIGNAL_SCORE:
+        return deny("signal_strength_insufficient",
+                    f"score={c.signal.score} min={MIN_FINAL_SIGNAL_SCORE}")
+    if (c.signal.ret_5m < MIN_FINAL_RET5_PCT or
+            c.signal.ret_15m < MIN_FINAL_RET15_PCT):
+        return deny("price_acceleration_not_confirmed",
+                    f"r5={c.signal.ret_5m:+.2f}% min={MIN_FINAL_RET5_PCT:.2f}% "
+                    f"r15={c.signal.ret_15m:+.2f}% min={MIN_FINAL_RET15_PCT:.2f}%")
     if not cdc_tradeable(pair):
         return deny("not_exchange_spot")
     if c.signal.qv24 < MIN_24H_QUOTE_VOL:
@@ -1400,6 +1414,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         atr_pct = fnum(m.get("atr_1m_pct"),0)
         if atr_pct <= 0:
             return deny("missing_volatility_evidence")
+        if m["r5"] < MIN_FINAL_RET5_PCT or m["r15"] < MIN_FINAL_RET15_PCT:
+            return deny("live_closed_candle_momentum_not_confirmed",
+                        f"r5={m['r5']:+.2f}% r15={m['r15']:+.2f}%")
         min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
         if stop_distance_pct < min_stop:
             return deny("stop_under_normal_volatility",
@@ -1787,6 +1804,27 @@ def pepito_selftest():
         assert can_alert("ADA_USDT",now+12*3600)
         last_alert_at.pop("ADA_USDT",None)
 
+        # V7b: the DOGE alert which escaped V7 on deployment did NOT show
+        # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
+        cdc_pairs.add("DOGE_USD")
+        doge=candidate("DOGE_USDT",0.085321)
+        doge.style="SWING_ACCUMULATION"
+        doge.signal.score=53
+        doge.signal.ret_5m=0.03
+        doge.signal.ret_15m=0.10
+        doge_ai=AIReview("DOGE_USDT","TRADE",95,"fixture",
+                        0.0852,0.08535,0.08415,0.0882,0.0916)
+        assert not validate_trade_review(doge_ai,doge)
+        doge.signal.score=80
+        assert not validate_trade_review(doge_ai,doge)
+        doge.signal.ret_5m=0.35
+        doge.signal.ret_15m=0.65
+        # A genuinely reaccelerating setup with identical cost geometry is
+        # not suppressed for simply being called DOGE.
+        assert validate_trade_review(doge_ai,doge)
+        doge_ai.confidence=70
+        assert not validate_trade_review(doge_ai,doge)
+
         # Never accept far-from-market order zones even with ambitious objectives.
         stale = AIReview("NIGHT_USDT", "TRADE", 99, "stale", 1.05, 1.06, 1.02, 1.12, 1.25)
         assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
@@ -1950,7 +1988,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
