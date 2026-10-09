@@ -1804,6 +1804,27 @@ def pepito_selftest():
         assert can_alert("ADA_USDT",now+12*3600)
         last_alert_at.pop("ADA_USDT",None)
 
+        # V7b: the DOGE alert which escaped V7 on deployment did NOT show
+        # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
+        cdc_pairs.add("DOGE_USD")
+        doge=candidate("DOGE_USDT",0.085321)
+        doge.style="SWING_ACCUMULATION"
+        doge.signal.score=53
+        doge.signal.ret_5m=0.03
+        doge.signal.ret_15m=0.10
+        doge_ai=AIReview("DOGE_USDT","TRADE",95,"fixture",
+                        0.0852,0.08535,0.08415,0.0882,0.0916)
+        assert not validate_trade_review(doge_ai,doge)
+        doge.signal.score=80
+        assert not validate_trade_review(doge_ai,doge)
+        doge.signal.ret_5m=0.35
+        doge.signal.ret_15m=0.65
+        # A genuinely reaccelerating setup with identical cost geometry is
+        # not suppressed for simply being called DOGE.
+        assert validate_trade_review(doge_ai,doge)
+        doge_ai.confidence=70
+        assert not validate_trade_review(doge_ai,doge)
+
         # Never accept far-from-market order zones even with ambitious objectives.
         stale = AIReview("NIGHT_USDT", "TRADE", 99, "stale", 1.05, 1.06, 1.02, 1.12, 1.25)
         assert not validate_trade_review(stale, candidate("NIGHT_USDT"))
@@ -1967,7 +1988,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
