@@ -1834,9 +1834,9 @@ def pepito_selftest():
         late_steps = sum(1 for x,y in zip(late, late[1:]) if y >= x*1.15)
         assert prog_steps >= 2 and late_steps < 2
 
-        # 3) Low absolute liquidity is rejected before spectacular relative volume matters.
+        # 3) Below the SILENT observation floor, even a relative spike is ignored.
         lp="SELFLOW_USDT"; history[lp].clear()
-        for i,qv in enumerate([100000,100001,100002,100003,100004,100005,100105]):
+        for i,qv in enumerate([5000,5001,5002,5003,5004,5005,5105]):
             history[lp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
         assert score_signal(lp, 0.0) is None
 
