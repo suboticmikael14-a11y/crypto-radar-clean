@@ -763,12 +763,18 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     # A new candidate must cross the early trigger. An existing pilot is different:
     # keep measuring its trajectory even after the anomaly cools down, otherwise
     # TRACKED pilots become dead memory and can never prove continuation/failure.
+    # Observation-only after a large daily move: repeated lower-intensity
+    # volume and stable momentum qualify for silent tracking, not a buy alert.
+    quiet_second_leg = bool(
+        not tracking and metrics and change24h >= MAX_PILOT_24H
+        and vol_ratio >= 1.5 and -0.10 <= ret5 <= 0.90
+        and 0.10 <= ret15 <= 3.0 and ret1 >= -0.20
+    )
     if not tracking:
         if metrics:
-            # Early accumulation can be nearly flat. For weak bursts require a
-            # price impulse as independent evidence.
             if not (vol_ratio >= EARLY_MIN_VOLUME_RATIO and ret5 >= -0.25
-                    or vol_ratio >= 1.30 and ret5 >= 0.45):
+                    or vol_ratio >= 1.30 and ret5 >= 0.45
+                    or quiet_second_leg):
                 return None
         elif vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
             return None
@@ -801,7 +807,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
-    if not tracking and score < early_score_floor and ret5 < 0.65:
+    if not tracking and score < early_score_floor and ret5 < 0.65 and not quiet_second_leg:
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
