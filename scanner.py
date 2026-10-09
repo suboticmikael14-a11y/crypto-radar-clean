@@ -842,15 +842,13 @@ def cleanup_expired_pilots(now: float):
 
 
 def open_pilot(sig: Signal, now: float) -> bool:
-    # Notre objectif est le pré-mouvement: on ne démarre pas un suivi
-    # si le token est déjà fortement étendu sur 24 h.
+    # Keep monitoring strong daily movers. This never sends Slack directly.
     if sig.change_24h > MAX_PILOT_24H:
         print(
-            f"PILOTE REJETE — {sig.pair} déjà étendu | "
-            f"24h={sig.change_24h:+.2f}% > {MAX_PILOT_24H:.2f}%",
+            f"PILOTE SUIVI ETENDU — {sig.pair} | 24h={sig.change_24h:+.2f}% "
+            f"| suivi silencieux",
             flush=True,
         )
-        return False
 
     pilots[sig.pair] = PilotState(
         created_at=now,
