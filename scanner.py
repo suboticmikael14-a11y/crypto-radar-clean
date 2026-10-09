@@ -1807,6 +1807,20 @@ def pepito_selftest():
         pilots.pop(hp6,None)
         history.pop(hp6,None)
 
+        # Microcap may be monitored at 25k of daily volume, but never alerted
+        # until execution liquidity has risen to the strict trading floor.
+        low_watch="TINYT_USDT"
+        history[low_watch].clear()
+        history[low_watch].append(Snapshot(now,1.0,25_000,0.9998,1.0002))
+        watch_metrics={"volume_ratio":18.0,"volume_1m_usd_est":400.0,
+                       "r1":0.12,"r5":0.80,"r15":1.20,"age_sec":15}
+        assert score_signal(low_watch,0,metrics=watch_metrics) is not None
+        cdc_pairs.add("TINYT_USD")
+        not_liquid=candidate(low_watch)
+        not_liquid.signal.qv24=25_000
+        assert not validate_trade_review(review(low_watch),not_liquid)
+        history.pop(low_watch,None)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1850,7 +1864,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
