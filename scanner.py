@@ -20,6 +20,7 @@ CDC_CANDLES_URL = "https://api.crypto.com/exchange/v1/public/get-candlestick"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "150000"))
+MIN_WATCH_24H_QUOTE_VOL = float(os.getenv("MIN_WATCH_24H_QUOTE_VOL", "10000"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -736,7 +737,9 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
         mid = (cur.ask + cur.bid) / 2
         spread = (cur.ask - cur.bid) / mid * 100.0 if mid else 999.0
 
-    if cur.qv24 < MIN_24H_QUOTE_VOL:
+    # Thin markets may be WATCHED early, but are never alerted as a trade
+    # until they meet the separate, stricter execution liquidity threshold.
+    if cur.qv24 < MIN_WATCH_24H_QUOTE_VOL:
         v5_diagnostics["volume_24h_insuffisant"] += 1
         return None
     if spread > 0.50:
@@ -1325,6 +1328,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         return deny("ai_confidence", f"value={review.confidence}")
     if not cdc_tradeable(pair):
         return deny("not_exchange_spot")
+    if c.signal.qv24 < MIN_24H_QUOTE_VOL:
+        return deny("execution_liquidity_below_min",
+                    f"quote24={c.signal.qv24:.0f} required={MIN_24H_QUOTE_VOL:.0f}")
     vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
     if any(v is None or v<=0 for v in vals):
         return deny("missing_order_levels")
