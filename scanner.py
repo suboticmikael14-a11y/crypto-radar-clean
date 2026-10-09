@@ -20,6 +20,7 @@ CDC_CANDLES_URL = "https://api.crypto.com/exchange/v1/public/get-candlestick"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "150000"))
+MIN_WATCH_24H_QUOTE_VOL = float(os.getenv("MIN_WATCH_24H_QUOTE_VOL", "10000"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -736,7 +737,13 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
         mid = (cur.ask + cur.bid) / 2
         spread = (cur.ask - cur.bid) / mid * 100.0 if mid else 999.0
 
-    if cur.qv24 < MIN_24H_QUOTE_VOL or spread > 0.50:
+    # Thin markets may be WATCHED early, but are never alerted as a trade
+    # until they meet the separate, stricter execution liquidity threshold.
+    if cur.qv24 < MIN_WATCH_24H_QUOTE_VOL:
+        v5_diagnostics["volume_24h_insuffisant"] += 1
+        return None
+    if spread > 0.50:
+        v5_diagnostics["spread_trop_large"] += 1
         return None
 
     if metrics:
@@ -744,6 +751,7 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
         # NOT the difference of two 24h sliding-volume counters.
         vol_ratio = metrics["volume_ratio"]
         if not tracking and metrics["volume_1m_usd_est"] < 150:
+            v5_diagnostics["volume_1m_insuffisant"] += 1
             return None
     else:
         # Legacy-only fallback retained for deterministic regression fixtures;
@@ -763,18 +771,27 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     # A new candidate must cross the early trigger. An existing pilot is different:
     # keep measuring its trajectory even after the anomaly cools down, otherwise
     # TRACKED pilots become dead memory and can never prove continuation/failure.
+    # Observation-only after a large daily move: repeated lower-intensity
+    # volume and stable momentum qualify for silent tracking, not a buy alert.
+    quiet_second_leg = bool(
+        not tracking and metrics and change24h >= MAX_PILOT_24H
+        and vol_ratio >= 1.5 and -0.10 <= ret5 <= 0.90
+        and 0.10 <= ret15 <= 3.0 and ret1 >= -0.20
+    )
     if not tracking:
         if metrics:
-            # Early accumulation can be nearly flat. For weak bursts require a
-            # price impulse as independent evidence.
             if not (vol_ratio >= EARLY_MIN_VOLUME_RATIO and ret5 >= -0.25
-                    or vol_ratio >= 1.30 and ret5 >= 0.45):
+                    or vol_ratio >= 1.30 and ret5 >= 0.45
+                    or quiet_second_leg):
+                v5_diagnostics["pas_d_anomalie_precoce"] += 1
                 return None
         elif vol_ratio < EARLY_MIN_VOLUME_RATIO and ret5 < 0.40:
             return None
     if ret1 < -0.35 or ret5 < -0.75:
+        v5_diagnostics["momentum_negatif"] += 1
         return None
     if not tracking and (ret5 > EARLY_MAX_RET5 or ret15 > 10.0):
+        v5_diagnostics["bougie_trop_etendue"] += 1
         return None
 
     # PEPITO scoring verrouillé: 30/20/15/15/10/10.
@@ -795,13 +812,15 @@ def score_signal(pair: str, gate_change24h: Optional[float] = None, tracking: bo
     score = min(100, round(100 * (volume_pts + flow_pts + liquidity_pts + unextended_pts + structure_pts) / 90))
 
     # Anti-chase: un x50/x100 déjà très étendu ne devient pas prioritaire.
-    if not tracking and (change24h >= 20.0 or ret15 > 9.0):
+    if not tracking and ret15 > 9.0:
+        v5_diagnostics["retour_15m_trop_etendu"] += 1
         return None
 
     # PEPITO: détection précoce silencieuse. Un score inférieur au seuil pilote
     # peut être mémorisé si le volume accélère déjà; aucune notification Slack ici.
     early_score_floor = max(35, PILOT_SCORE - 35)
-    if not tracking and score < early_score_floor and ret5 < 0.65:
+    if not tracking and score < early_score_floor and ret5 < 0.65 and not quiet_second_leg:
+        v5_diagnostics["score_radar_insuffisant"] += 1
         return None
 
     # En V2, aucun signal n'est "CONFIRME" sur un seul scan.
@@ -842,15 +861,13 @@ def cleanup_expired_pilots(now: float):
 
 
 def open_pilot(sig: Signal, now: float) -> bool:
-    # Notre objectif est le pré-mouvement: on ne démarre pas un suivi
-    # si le token est déjà fortement étendu sur 24 h.
+    # Keep monitoring strong daily movers. This never sends Slack directly.
     if sig.change_24h > MAX_PILOT_24H:
         print(
-            f"PILOTE REJETE — {sig.pair} déjà étendu | "
-            f"24h={sig.change_24h:+.2f}% > {MAX_PILOT_24H:.2f}%",
+            f"PILOTE SUIVI ETENDU — {sig.pair} | 24h={sig.change_24h:+.2f}% "
+            f"| suivi silencieux",
             flush=True,
         )
-        return False
 
     pilots[sig.pair] = PilotState(
         created_at=now,
@@ -915,8 +932,16 @@ def continuation_ok(sig, pilot, age_min, price_gain):
         return False
     if not (0.35 <= sig.ret_5m <= 3.0 and 0.55 <= sig.ret_15m <= 6.0):
         return False
-    if sig.spread_pct > 0.20 or sig.change_24h > 22.0:
+    if sig.spread_pct > 0.20:
         return False
+    # A market already extended over 24h only qualifies for a NEW leg after
+    # multiple observations, at least eight minutes, and moderate 5m/15m moves.
+    if max(sig.change_24h, pilot.first_change_24h) > 20.0:
+        if (pilot.sightings < 8 or age_min < 8.0
+                or sig.vol_ratio < 1.2
+                or sig.ret_5m > 1.6 or sig.ret_15m > 3.5
+                or price_gain > 5.0):
+            return False
     return True
 
 
@@ -1303,6 +1328,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
         return deny("ai_confidence", f"value={review.confidence}")
     if not cdc_tradeable(pair):
         return deny("not_exchange_spot")
+    if c.signal.qv24 < MIN_24H_QUOTE_VOL:
+        return deny("execution_liquidity_below_min",
+                    f"quote24={c.signal.qv24:.0f} required={MIN_24H_QUOTE_VOL:.0f}")
     vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
     if any(v is None or v<=0 for v in vals):
         return deny("missing_order_levels")
@@ -1456,6 +1484,7 @@ def run():
     while True:
         started = time.time()
         try:
+            v5_diagnostics.clear()
             tickers = fetch_tickers()
             now = time.time()
             try:
@@ -1513,6 +1542,10 @@ def run():
                 f"| nouveaux candidats={len(raw_signals)} | suivis actifs réévalués={len(tracked_signals)}",
                 flush=True
             )
+            if v5_diagnostics:
+                print("V6 ENTONNOIR — " + " | ".join(
+                    f"{reason}={count}" for reason,count in v5_diagnostics.most_common(12)
+                ), flush=True)
             gate_rejections.clear()
             confirmed = []
             for sig in raw_signals + tracked_signals:
@@ -1533,6 +1566,12 @@ def run():
             due = []
             for c in confirmed:
                 pair = c.signal.pair
+                if c.signal.qv24 < MIN_24H_QUOTE_VOL:
+                    # Keep silently tracking; do not spend AI tokens on an
+                    # order that the execution gate is required to reject.
+                    print(f"V6 SUIVI SANS ACHAT — {pair} | volume24={c.signal.qv24:.0f} "
+                          f"< minimum execution={MIN_24H_QUOTE_VOL:.0f}", flush=True)
+                    continue
                 if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
                     print(
                         f"AI IGNORE — {pair} trop ancien | age={c.age_min:.0f}m > {AI_MAX_SIGNAL_AGE_MIN}m",
@@ -1750,6 +1789,44 @@ def pepito_selftest():
         assert set(pair_list)=={"OGN_USDT","RLC_USDT"}, pair_list
         history.pop(vp,None)
 
+        # V6: an extended coin may enter silent surveillance after a new base.
+        hp6="V6HOT_USDT"
+        history[hp6].clear()
+        history[hp6].append(Snapshot(now,1.0,2_000_000,0.9997,1.0003))
+        quiet={"volume_ratio":3.0,"volume_1m_usd_est":1500.0,
+               "r1":0.05,"r5":0.25,"r15":0.72,"age_sec":18}
+        hot_sig=score_signal(hp6,40.0,metrics=quiet)
+        assert hot_sig is not None and hot_sig.change_24h==40.0
+        assert open_pilot(hot_sig,now) and hp6 in pilots
+        hp6_pilot=pilots[hp6]
+        hp6_pilot.sightings=10
+        hp6_pilot.best_score=80
+        hp6_pilot.best_vol_ratio=12.0
+        reaccel=synthetic_signal(pair=hp6,price=1.009,score=69,vol=4.0,
+                                 r1=0.10,r5=0.65,r15=1.1,change24=41.0)
+        assert continuation_ok(reaccel,hp6_pilot,11,0.9)
+        assert not continuation_ok(reaccel,hp6_pilot,3,0.9)
+        assert not continuation_ok(
+            synthetic_signal(pair=hp6,price=1.009,score=69,vol=4,
+                             r1=0.5,r5=3.0,r15=6.0,change24=41),
+            hp6_pilot,12,0.9)
+        pilots.pop(hp6,None)
+        history.pop(hp6,None)
+
+        # Microcap may be monitored at 25k of daily volume, but never alerted
+        # until execution liquidity has risen to the strict trading floor.
+        low_watch="TINYT_USDT"
+        history[low_watch].clear()
+        history[low_watch].append(Snapshot(now,1.0,25_000,0.9998,1.0002))
+        watch_metrics={"volume_ratio":18.0,"volume_1m_usd_est":400.0,
+                       "r1":0.12,"r5":0.80,"r15":1.20,"age_sec":15}
+        assert score_signal(low_watch,0,metrics=watch_metrics) is not None
+        cdc_pairs.add("TINYT_USD")
+        not_liquid=candidate(low_watch)
+        not_liquid.signal.qv24=25_000
+        assert not validate_trade_review(review(low_watch),not_liquid)
+        history.pop(low_watch,None)
+
         # 2) Progressive acceleration beats a late isolated x100 spike.
         progressive = [3.2, 6.8, 12.0, 20.0]
         late = [3.0, 3.1, 3.0, 100.0]
@@ -1757,9 +1834,9 @@ def pepito_selftest():
         late_steps = sum(1 for x,y in zip(late, late[1:]) if y >= x*1.15)
         assert prog_steps >= 2 and late_steps < 2
 
-        # 3) Low absolute liquidity is rejected before spectacular relative volume matters.
+        # 3) Below the SILENT observation floor, even a relative spike is ignored.
         lp="SELFLOW_USDT"; history[lp].clear()
-        for i,qv in enumerate([100000,100001,100002,100003,100004,100005,100105]):
+        for i,qv in enumerate([5000,5001,5002,5003,5004,5005,5105]):
             history[lp].append(Snapshot(now-360+i*60,1.0,qv,0.999,1.001))
         assert score_signal(lp, 0.0) is None
 
@@ -1793,7 +1870,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
