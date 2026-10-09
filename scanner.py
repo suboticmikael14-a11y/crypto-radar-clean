@@ -1289,65 +1289,77 @@ def ai_review_batch(candidates):
 
 
 def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
-    """Garde-fous déterministes avant toute notification Slack."""
-    if review.decision != "TRADE" or review.confidence < 70:
+    """Fail-closed order validation, diagnostic reason for EVERY rejection.
+    Trades are never automatically placed; only qualified Slack alerts are sent.
+    """
+    pair = c.signal.pair
+    def deny(reason, detail=""):
+        print(f"V5 REFUS — {pair} | cause={reason}"+(f" | {detail}" if detail else ""),flush=True)
         return False
-    if not cdc_tradeable(c.signal.pair):
-        print(f"TRADE BLOQUE CDC — {c.signal.pair} absent de Crypto.com Exchange spot", flush=True)
-        return False
+
+    if review.decision != "TRADE":
+        return deny("ai_not_trade")
+    if review.confidence < 70:
+        return deny("ai_confidence", f"value={review.confidence}")
+    if not cdc_tradeable(pair):
+        return deny("not_exchange_spot")
     vals = [review.entry_low, review.entry_high, review.invalidation, review.tp1, review.tp2]
-    if any(v is None or v <= 0 for v in vals):
-        return False
+    if any(v is None or v<=0 for v in vals):
+        return deny("missing_order_levels")
     lo, hi, inv, tp1, tp2 = vals
-    if lo > hi or not (inv < lo <= hi < tp1 < tp2):
-        return False
-    # Reject stale or out-of-market AI entry zones.
-    if abs(pct(c.signal.price, (lo + hi) / 2.0)) > MAX_ENTRY_DRIFT_PCT:
-        return False
+    if lo>hi or not (inv<lo<=hi<tp1<tp2):
+        return deny("invalid_level_order", f"entry={lo}:{hi} stop={inv} tp1={tp1} tp2={tp2}")
+    distance = abs(pct(c.signal.price, (lo+hi)/2))
+    if distance > MAX_ENTRY_DRIFT_PCT:
+        return deny("stale_entry_zone", f"drift={distance:.2f}% max={MAX_ENTRY_DRIFT_PCT:.2f}%")
 
-    # Check worst executable entry within the proposed zone (hi), not midpoint.
-    # Use a conservative round-trip cost reserve; actual app quotes may be worse.
     costs_pct = max(0.0, ROUND_TRIP_FEE_PCT) + max(0.0, EXECUTION_BUFFER_PCT)
-    gross_tp1_pct = (tp1 / hi - 1.0) * 100.0
-    gross_tp2_pct = (tp2 / hi - 1.0) * 100.0
-    net_tp1_pct = gross_tp1_pct - costs_pct
-    net_tp2_pct = gross_tp2_pct - costs_pct
-    loss_including_costs_pct = (hi - inv) / hi * 100.0 + costs_pct
-    net_rr = net_tp2_pct / loss_including_costs_pct if loss_including_costs_pct > 0 else 0.0
+    net_tp1 = (tp1/hi-1.0)*100.0-costs_pct
+    net_tp2 = (tp2/hi-1.0)*100.0-costs_pct
+    risk = (hi-inv)/hi*100.0+costs_pct
+    net_rr = net_tp2/risk if risk>0 else 0.0
+    detail=(f"TP1_net={net_tp1:+.2f}% TP2_net={net_tp2:+.2f}% "
+            f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
+    if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
+        return deny("net_profit_or_reward_risk",detail)
+    if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style=="MOMENTUM":
+        return deny("stale_momentum",f"age={c.age_min:.0f}m")
+    cap = (12.0 if c.style=="CONTINUATION" else
+           2.5 if c.style=="SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN)
+    if c.price_gain > cap:
+        return deny("overextended_since_pilot",f"gain={c.price_gain:+.2f}% cap={cap:.2f}%")
 
-    if (net_tp1_pct < MIN_NET_TP1_PCT
-            or net_tp2_pct < MIN_NET_TP2_PCT
-            or net_rr < MIN_NET_REWARD_RISK):
-        print(
-            f"TRADE BLOQUE RENTABILITE — {c.signal.pair} | "
-            f"TP1_net={net_tp1_pct:+.2f}% | TP2_net={net_tp2_pct:+.2f}% | "
-            f"risque_frais={loss_including_costs_pct:.2f}% | "
-            f"RR_net={net_rr:.2f} | reserve_frais={costs_pct:.2f}%",
-            flush=True,
-        )
-        return False
-
-    if c.age_min > AI_MAX_SIGNAL_AGE_MIN and c.style == "MOMENTUM":
-        return False
-    if c.price_gain > (12.0 if c.style == "CONTINUATION" else
-                       2.5 if c.style == "SWING_ACCUMULATION" else AI_MAX_PRICE_GAIN):
-        return False
     if not V4_BACKTEST_MODE:
-        x = cdc_ticker_by_pair.get(c.signal.pair)
-        if not x or not cdc_tradeable(c.signal.pair):
-            return False
-        # Recent Exchange-native candle and a live executable quote are mandatory.
-        m = cdc_candle_metrics(c.signal.pair)
-        if not m or m["age_sec"] > CANDLE_MIN_FRESH_SEC:
-            return False
-        # No apparent momentum is tradable on zero CDC execution volume.
+        market = cdc_ticker_by_pair.get(pair)
+        if not market:
+            return deny("missing_live_exchange_market")
+        m = cdc_candle_metrics(pair)
+        if not m or m["age_sec"]>CANDLE_MIN_FRESH_SEC:
+            return deny("stale_exchange_candles")
         if m["volume_1m_usd_est"] < 300.0 and m["volume_ratio"] < 1.2:
-            return False
+            return deny("insufficient_real_exchange_volume",
+                        f"1m_usd={m['volume_1m_usd_est']:.0f} x={m['volume_ratio']:.1f}")
         if m["volume_ratio"] < 1.2 and m["r5"] < 0.25:
-            return False
-        if abs(c.signal.price / fnum(x["last"]) - 1.0) > 0.003:
-            return False
-    return True
+            return deny("no_volume_or_momentum_confirmation",
+                        f"vol=x{m['volume_ratio']:.1f} r5={m['r5']:+.2f}%")
+        if abs(c.signal.price/max(1e-12,fnum(market["last"]))-1.0)>0.003:
+            return deny("market_moved_after_scan")
+        # Re-quote the actual exchange spot orderbook immediately before notifying
+        # the user; the AI may have been running for many seconds.
+        try:
+            rq = session.get(CDC_TICKERS_URL,
+                             params={"instrument_name":market["exchange_symbol"]},
+                             timeout=8)
+            rq.raise_for_status()
+            live = normalize_cdc_tickers(rq.json(),
+                                         {market["exchange_symbol"]},time.time())
+            if not live:
+                return deny("no_fresh_executable_quote")
+            ask = fnum(live[0].get("lowest_ask"))
+            if ask<=0 or not (lo*0.9985<=ask<=hi*1.001):
+                return deny("ask_outside_buy_zone",f"ask={ask:.10g} entry={lo:.10g}:{hi:.10g}")
+        except Exception as exc:
+            return deny("exchange_requote_error",f"exception={type(exc).__name__}")
     return True
 
 
