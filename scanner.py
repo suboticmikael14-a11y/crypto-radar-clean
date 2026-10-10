@@ -2538,8 +2538,42 @@ def pepito_integration_test():
           +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
 
 
+def pepito_spec_book_test():
+    """Read-only real Exchange API schema and two-sided liquidity test; no Slack."""
+    refresh_cdc_pairs()
+    tickers=fetch_tickers()
+    if len(tickers)<100:
+        raise AssertionError("CDC catalog unexpectedly low")
+    accepted=0
+    for sym in ("SUI","BTC","STRK","AURORA"):
+        pair=sym+"_USDT"
+        live=cdc_ticker_by_pair.get(pair)
+        if not live:
+            continue
+        r=session.get(CDC_BOOK_URL,
+                      params={"instrument_name":live["exchange_symbol"],"depth":"50"},
+                      timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        body=r.json()
+        assert body.get("code")==0, f"get-book unavailable: {pair}"
+        result=body.get("result",{})
+        assert result.get("instrument_name")==live["exchange_symbol"]
+        rows=result.get("data") or []
+        assert rows and isinstance(rows[0].get("bids"),list) and isinstance(rows[0].get("asks"),list)
+        quality=speculative_fetch_book(pair,live)
+        print(f"V9B LIVE BOOK — {pair} | levels bid={len(rows[0]['bids'])} "
+              f"ask={len(rows[0]['asks'])} | $200 accepted={bool(quality)} "
+              f"| best-bid={rows[0]['bids'][0][0] if rows[0]['bids'] else 'none'} "
+              f"| best-ask={rows[0]['asks'][0][0] if rows[0]['asks'] else 'none'}",flush=True)
+        accepted+=bool(quality)
+    assert accepted>=1, "No real book supports $200 two-sided checks; do not deploy"
+    print("V9B LIVE BOOK TEST — PASS, NO SLACK",flush=True)
+
+
 if __name__ == "__main__":
-    if os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
+    if os.getenv("PEPITO_SPEC_BOOK_TEST", "0").lower() in {"1","true","yes","on"}:
+        pepito_spec_book_test()
+    elif os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
         pepito_integration_test()
     elif os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
         pepito_selftest()
