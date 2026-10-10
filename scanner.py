@@ -1743,7 +1743,7 @@ def run():
         f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
-        f"Slack={\'TRADE_PLUS_SPEC\' if SPEC_ENABLED else \'TRADE_ONLY\'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
+        f"Slack={'TRADE_PLUS_SPEC' if SPEC_ENABLED else 'TRADE_ONLY'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
         flush=True,
     )
     if AI_ENABLED and not OPENAI_API_KEY:
