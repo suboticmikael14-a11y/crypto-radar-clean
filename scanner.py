@@ -609,7 +609,9 @@ def cdc_candle_metrics(pair, now=None):
     if not item:
         return None
     instrument = item.get("exchange_symbol")
-    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument:
+    # Speculative watchlists refresh EVERY scan for a second distinct closed
+    # candle. Other markets retain the 75s cache to protect the exchange API.
+    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument and pair not in spec_candidates:
         return cached[1]
     try:
         r = session.get(CDC_CANDLES_URL, params={
