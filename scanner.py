@@ -2285,6 +2285,33 @@ def pepito_selftest():
              "quote_volume":600000},dict(impulse))
         assert MIN_24H_QUOTE_VOL>=500000
 
+        # V9B regression: V9 detects all movements, Slack promotes very few.
+        def spec_item(spread, qv=1500):
+            return {"currency_pair":"SPEC_USDT","exchange_symbol":"SPEC_USD",
+                    "last":1.0,"highest_bid":1.0-spread/200,
+                    "lowest_ask":1.0+spread/200,
+                    "quote_volume":qv}
+        base_candle={"age_sec":15,"closed_at":now-60,
+                     "volume_5m_usd_est":500,"r1":0.2,"r5":4.3,"r15":5.2}
+        assert speculative_evidence(spec_item(1.0),dict(base_candle,volume_5m_usd_est=3))
+        assert speculative_notification_precheck(spec_item(1.0),base_candle) is None
+        assert speculative_notification_precheck(spec_item(1.0),dict(base_candle,r5=1.5))
+        assert speculative_notification_precheck(spec_item(1.0),dict(base_candle,volume_5m_usd_est=22))
+        assert speculative_notification_precheck(spec_item(9.8),base_candle)
+        # $200 BOTH ways at tight prices: accepted; old fake $20 books blocked.
+        enough={"asks":[[1.01,700],[1.015,700]],"bids":[[1.0,700],[0.995,700]]}
+        qual=speculative_book_quality(enough)
+        assert qual and 0<qual["cross_pct"]<2.5
+        assert speculative_book_quality({"asks":[[1.01,1]],"bids":[[1.0,700]]}) is None
+        assert speculative_book_quality({"asks":[[1.01,700]],"bids":[[1.0,1]]}) is None
+        assert speculative_book_quality({"asks":[[1.02,700]],"bids":[[0.99,700]]}) is None
+        assert speculative_book_quality({"asks":[[1.01,1],[1.07,700]],
+                                         "bids":[[1.0,700]]}) is None
+        book_msg=speculative_message("SPEC_USDT",spec_item(1.0),base_candle,qual)
+        assert "MICROCAP SPÉCULATIVE FILTRÉE" in book_msg
+        assert "PAS TRADE VALIDÉ" in book_msg and "AUCUN ORDRE AUTOMATIQUE" in book_msg
+        assert "200 USD" in book_msg and "AVANT FRAIS" in book_msg
+
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
         cdc_pairs.add("DOGE_USD")
@@ -2473,7 +2500,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V9B_SELECTIVE_NOTIFY_BOOK_DEPTH | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
