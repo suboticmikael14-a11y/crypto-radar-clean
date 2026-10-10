@@ -53,6 +53,12 @@ MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "2.00"))
 MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "6.00"))
 MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+# V8 — user has time to open CDC Exchange; no arbitrary three-minute expiry.
+# The full net-after-cost payoff and reward/risk MUST still hold at the buy cap.
+SIGNAL_ENTRY_WINDOW_MIN = int(os.getenv("SIGNAL_ENTRY_WINDOW_MIN", "15"))
+ENTRY_EXTENSION_MAX_PCT = float(os.getenv("ENTRY_EXTENSION_MAX_PCT", "0.60"))
+MIN_ENTRY_HEADROOM_PCT = float(os.getenv("MIN_ENTRY_HEADROOM_PCT", "0.30"))
+ENTRY_PULLBACK_MAX_PCT = float(os.getenv("ENTRY_PULLBACK_MAX_PCT", "0.20"))
 MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
 MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
 MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
@@ -1342,6 +1348,44 @@ def ai_review_batch(candidates):
     return best, reviews
 
 
+def compute_entry_guardrails(review: AIReview):
+    """Conservative entry limits, valid only while the original signal is fresh.
+
+    Calculations use the worst-case intended BUY price and reserve round-trip
+    costs, rather than assuming a static price can be chased for 15 minutes.
+    The result NEVER loosens the 2%/6% net or 2x net reward/risk gates.
+    """
+    lo, hi, inv, tp1, tp2 = (review.entry_low, review.entry_high,
+                              review.invalidation, review.tp1, review.tp2)
+    if any(x is None or not math.isfinite(x) or x <= 0 for x in (lo,hi,inv,tp1,tp2)):
+        return None
+    if not (inv<lo<=hi<tp1<tp2):
+        return None
+    cost = (max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT))/100.0
+    rr = max(0.1,MIN_NET_REWARD_RISK)
+    # x <= target / (1+minimum_net+transaction_cost)
+    max_tp1 = tp1/(1.0 + MIN_NET_TP1_PCT/100.0 + cost)
+    max_tp2 = tp2/(1.0 + MIN_NET_TP2_PCT/100.0 + cost)
+    # (tp2/x-1-cost) >= rr * ((x-inv)/x+cost)
+    max_rr = (tp2 + rr*inv)/(1.0 + rr + (rr+1.0)*cost)
+    hard_cap = min(max_tp1,max_tp2,max_rr,hi*(1.0+ENTRY_EXTENSION_MAX_PCT/100.0))
+    floor = max(inv*(1.0+0.0001),lo*(1.0-ENTRY_PULLBACK_MAX_PCT/100.0))
+    if not (floor <= hi <= hard_cap):
+        return None
+    # Round max BUY price DOWN (never up past the net-profit threshold).
+    decimals = max(0, 10 - 1 - math.floor(math.log10(hard_cap)))
+    cap = math.floor(hard_cap * 10**decimals) / 10**decimals
+    if cap < hi or floor > cap:
+        return None
+    return (floor,cap)
+
+
+def entry_has_headroom(review: AIReview) -> bool:
+    """Don't notify just-barely-valid opportunities that expire on a tiny uptick."""
+    band = compute_entry_guardrails(review)
+    return band is not None and band[1] >= review.entry_high * (1.0 + MIN_ENTRY_HEADROOM_PCT/100.0)
+
+
 def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
     """Fail-closed order validation, diagnostic reason for EVERY rejection.
     Trades are never automatically placed; only qualified Slack alerts are sent.
@@ -1387,6 +1431,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
     if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
         return deny("net_profit_or_reward_risk",detail)
+    if not entry_has_headroom(review):
+        return deny("no_practical_entry_headroom",
+                    f"need_extension={MIN_ENTRY_HEADROOM_PCT:.2f}% under true net TP1/TP2/RR caps")
     # Start with a style-dependent minimum stop; live data will increase the
     # required distance when true range is wider than ordinary conditions.
     min_stop = (
