@@ -53,6 +53,12 @@ MIN_NET_TP1_PCT = float(os.getenv("MIN_NET_TP1_PCT", "2.00"))
 MIN_NET_TP2_PCT = float(os.getenv("MIN_NET_TP2_PCT", "6.00"))
 MIN_NET_REWARD_RISK = float(os.getenv("MIN_NET_REWARD_RISK", "2.00"))
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.50"))
+# V8 — user has time to open CDC Exchange; no arbitrary three-minute expiry.
+# The full net-after-cost payoff and reward/risk MUST still hold at the buy cap.
+SIGNAL_ENTRY_WINDOW_MIN = int(os.getenv("SIGNAL_ENTRY_WINDOW_MIN", "15"))
+ENTRY_EXTENSION_MAX_PCT = float(os.getenv("ENTRY_EXTENSION_MAX_PCT", "0.60"))
+MIN_ENTRY_HEADROOM_PCT = float(os.getenv("MIN_ENTRY_HEADROOM_PCT", "0.30"))
+ENTRY_PULLBACK_MAX_PCT = float(os.getenv("ENTRY_PULLBACK_MAX_PCT", "0.20"))
 MIN_STOP_MOMENTUM_PCT = float(os.getenv("MIN_STOP_MOMENTUM_PCT", "0.55"))
 MIN_STOP_CONTINUATION_PCT = float(os.getenv("MIN_STOP_CONTINUATION_PCT", "0.80"))
 MIN_STOP_SWING_PCT = float(os.getenv("MIN_STOP_SWING_PCT", "1.35"))
@@ -1342,6 +1348,51 @@ def ai_review_batch(candidates):
     return best, reviews
 
 
+def compute_entry_guardrails(review: AIReview, style="MOMENTUM", atr_pct=0.0):
+    """Conservative entry limits, valid only while the original signal is fresh.
+
+    Calculations use the worst-case intended BUY price and reserve round-trip
+    costs, rather than assuming a static price can be chased for 15 minutes.
+    The result NEVER loosens the 2%/6% net or 2x net reward/risk gates.
+    """
+    lo, hi, inv, tp1, tp2 = (review.entry_low, review.entry_high,
+                              review.invalidation, review.tp1, review.tp2)
+    if any(x is None or not math.isfinite(x) or x <= 0 for x in (lo,hi,inv,tp1,tp2)):
+        return None
+    if not (inv<lo<=hi<tp1<tp2):
+        return None
+    cost = (max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT))/100.0
+    rr = max(0.1,MIN_NET_REWARD_RISK)
+    # x <= target / (1+minimum_net+transaction_cost)
+    max_tp1 = tp1/(1.0 + MIN_NET_TP1_PCT/100.0 + cost)
+    max_tp2 = tp2/(1.0 + MIN_NET_TP2_PCT/100.0 + cost)
+    # (tp2/x-1-cost) >= rr * ((x-inv)/x+cost)
+    max_rr = (tp2 + rr*inv)/(1.0 + rr + (rr+1.0)*cost)
+    hard_cap = min(max_tp1,max_tp2,max_rr,hi*(1.0+ENTRY_EXTENSION_MAX_PCT/100.0))
+    min_stop = (MIN_STOP_SWING_PCT if style=="SWING_ACCUMULATION" else
+                MIN_STOP_CONTINUATION_PCT if style=="CONTINUATION" else
+                MIN_STOP_MOMENTUM_PCT)
+    min_stop = max(min_stop, STOP_ATR_MULTIPLE * max(0.0, fnum(atr_pct)))
+    if min_stop >= 90:
+        return None
+    floor = max(inv/(1.0-min_stop/100.0),
+                lo*(1.0-ENTRY_PULLBACK_MAX_PCT/100.0))
+    if not (floor <= hi <= hard_cap):
+        return None
+    # Round max BUY price DOWN (never up past the net-profit threshold).
+    decimals = max(0, 10 - 1 - math.floor(math.log10(hard_cap)))
+    cap = math.floor(hard_cap * 10**decimals) / 10**decimals
+    if cap < hi or floor > cap:
+        return None
+    return (floor,cap)
+
+
+def entry_has_headroom(review: AIReview, style="MOMENTUM", atr_pct=0.0) -> bool:
+    """Don't notify just-barely-valid opportunities that expire on a tiny uptick."""
+    band = compute_entry_guardrails(review, style, atr_pct)
+    return band is not None and band[1] >= review.entry_high * (1.0 + MIN_ENTRY_HEADROOM_PCT/100.0)
+
+
 def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
     """Fail-closed order validation, diagnostic reason for EVERY rejection.
     Trades are never automatically placed; only qualified Slack alerts are sent.
@@ -1387,6 +1438,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
     if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
         return deny("net_profit_or_reward_risk",detail)
+    if not entry_has_headroom(review,c.style):
+        return deny("no_practical_entry_headroom",
+                    f"need_extension={MIN_ENTRY_HEADROOM_PCT:.2f}% under true net TP1/TP2/RR caps")
     # Start with a style-dependent minimum stop; live data will increase the
     # required distance when true range is wider than ordinary conditions.
     min_stop = (
@@ -1418,6 +1472,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             return deny("live_closed_candle_momentum_not_confirmed",
                         f"r5={m['r5']:+.2f}% r15={m['r15']:+.2f}%")
         min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
+        if not entry_has_headroom(review,c.style,atr_pct):
+            return deny("no_practical_entry_after_volatility",
+                        f"min_stop={min_stop:.2f}%")
         if stop_distance_pct < min_stop:
             return deny("stop_under_normal_volatility",
                         f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% "
@@ -1458,33 +1515,42 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
-    hi = review.entry_high
+    m = candle_cache.get(s.pair,(0,{}))[1] or {}
+    entry_range = compute_entry_guardrails(review,c.style,m.get("atr_1m_pct",0.0))
+    if entry_range is None:
+        raise ValueError("entry risk band failed closed before Slack")
+    entry_floor, entry_cap = entry_range
     costs = max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT)
-    net1 = (review.tp1/hi-1)*100-costs
-    net2 = (review.tp2/hi-1)*100-costs
-    risk = (hi-review.invalidation)/hi*100+costs
+    net1 = (review.tp1/entry_cap-1)*100-costs
+    net2 = (review.tp2/entry_cap-1)*100-costs
+    risk = (entry_cap-review.invalidation)/entry_cap*100+costs
     rr = net2/risk if risk>0 else 0.0
     return (
-        f"PEPITO — ENTRÉE QUALIFIÉE, PRIX À RESPECTER\n"
+        f"PEPITO — TRADE VALIDÉ AU MOMENT DE L'ALERTE | ACHAT LIMIT MANUEL\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
         f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
         f"Marché de référence : {cdc_ticker_by_pair.get(s.pair, {}).get('exchange_symbol','Crypto.com Exchange')}\n"
         f"Prix actuel : {s.price:.10g}\n"
-        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
-        f"Invalidation : {review.invalidation:.10g}\n"
+        f"Zone initiale IA : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
+        f"PRIX D'ACHAT MAXIMUM (LIMIT) : {entry_cap:.10g} USD\n"
+        f"Bande de contrôle à l'achat : {entry_floor:.10g} → {entry_cap:.10g} USD\n"
+        f"Invalidation (stop) : {review.invalidation:.10g}\n"
         f"TP1 : {review.tp1:.10g}\n"
         f"TP2 : {review.tp2:.10g}\n"
         f"Confiance IA : {review.confidence}/100\n"
-        f"Potentiel net estimé après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
-        f"Perte stop coûts inclus (est.) : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
+        f"Potentiel net estimé AU PRIX MAX après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
+        f"Perte stop coûts inclus (est.) AU PRIX MAX : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
         f"Pourquoi : {review.reason}\n\n"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
         f"spread {s.spread_pct:.3f}%\n"
-        f"⚠️ Valable 3 minutes maximum ET uniquement si l'ask Exchange est dans la zone d'entrée.\n"
-        f"⚠️ Si le prix sort de la zone ou franchit l'invalidation, PAS D'ACHAT.\n"
-        f"Frais et glissement estimés, profits non garantis.\n"
+        f"✅ Fenêtre de décision : {SIGNAL_ENTRY_WINDOW_MIN} min MAXIMUM après réception, pas un achat garanti.\n"
+        f"⚠️ ACHAT LIMIT uniquement : vérifier que l'ask Crypto.com est dans la bande de contrôle.\n"
+        f"⚠️ Annuler tout ordre LIMIT non exécuté avant la fin des {SIGNAL_ENTRY_WINDOW_MIN} minutes ; ne pas laisser GTC en attente.\n"
+        f"⚠️ Au-dessus du plafond, sous le plancher, sous le stop ou après la fenêtre : PAS D'ACHAT.\n"
+        f"⚠️ Si le mouvement s'inverse franchement ou la liquidité disparaît : PAS D'ACHAT.\n"
+        f"Frais et glissement estimés, profits non garantis. AUCUN ORDRE AUTOMATIQUE.\n"
         f"Source prix/volume : Crypto.com Exchange (Spot) | Gate.io : auxiliaire"
     )
 
@@ -1541,7 +1607,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V7 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
+        f"VALIDATION V8 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1798,11 +1864,46 @@ def pepito_selftest():
         assert not validate_trade_review(too_tight,candidate("NIGHT_USDT",1.0195))
         assert validate_trade_review(review("NIGHT_USDT"),candidate("NIGHT_USDT"))
         info=format_trade_alert(candidate("NIGHT_USDT"),review("NIGHT_USDT"))
-        assert "Potentiel net estimé" in info and "3 minutes maximum" in info
+        assert "Potentiel net estimé" in info and "15 min MAXIMUM" in info
+        assert "PRIX D'ACHAT MAXIMUM (LIMIT)" in info and "ACHAT LIMIT uniquement" in info
+        assert "3 minutes" not in info
         last_alert_at["ADA_USDT"]=now-12*3600
         assert not can_alert("ADA_USDT",now)
         assert can_alert("ADA_USDT",now+12*3600)
         last_alert_at.pop("ADA_USDT",None)
+
+        # V8: NEAR's historical narrow profit headroom is too fragile to
+        # preserve +2% net with a +0.25% ask drift (the actual phone screenshot).
+        near=AIReview("NEAR_USDT","TRADE",82,"real alert",
+                      5.0,5.01,4.95,5.18,5.40)
+        lo_near,cap_near=compute_entry_guardrails(near,"CONTINUATION",0.05)
+        assert 5.01 < cap_near < 5.0226 and lo_near < 5.01
+        assert not entry_has_headroom(near,"CONTINUATION",0.05)
+        cdc_pairs.add("NEAR_USD")
+        not_durable=candidate("NEAR_USDT",5.0072)
+        not_durable.style="CONTINUATION"
+        assert not validate_trade_review(near,not_durable)
+
+        # A stronger setup is actionable WITHOUT asking ChatGPT again:
+        # the bound allows a reasonable positive price drift while EVERY gate
+        # remains true even for an entry at the upper cap.
+        sturdy=AIReview("NEAR_USDT","TRADE",95,"strong fixture",
+                        5.00,5.01,4.95,5.28,5.60)
+        floor,cap=compute_entry_guardrails(sturdy,"CONTINUATION",0.05)
+        assert floor < 5.01 and cap >= 5.01*1.003
+        fees=ROUND_TRIP_FEE_PCT+EXECUTION_BUFFER_PCT
+        tp1_net=(sturdy.tp1/cap-1)*100-fees
+        tp2_net=(sturdy.tp2/cap-1)*100-fees
+        stop_risk=(cap-sturdy.invalidation)/cap*100+fees
+        assert tp1_net>=MIN_NET_TP1_PCT-1e-7
+        assert tp2_net>=MIN_NET_TP2_PCT-1e-7
+        assert tp2_net/stop_risk>=MIN_NET_REWARD_RISK-1e-7
+        assert (sturdy.tp1/(cap*1.01)-1)*100-fees < tp1_net
+        assert entry_has_headroom(sturdy,"CONTINUATION",0.05)
+        assert validate_trade_review(sturdy,not_durable)
+        slack_message=format_trade_alert(not_durable,sturdy)
+        assert "15 min MAXIMUM" in slack_message and "5.01" in slack_message
+        assert "AUCUN ORDRE AUTOMATIQUE" in slack_message
 
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
@@ -1819,8 +1920,12 @@ def pepito_selftest():
         assert not validate_trade_review(doge_ai,doge)
         doge.signal.ret_5m=0.35
         doge.signal.ret_15m=0.65
-        # A genuinely reaccelerating setup with identical cost geometry is
-        # not suppressed for simply being called DOGE.
+        # V8 rejects even a reacceleration if net upside has virtually no
+        # room for a human to open CDC; this is intentional, not a DOGE ban.
+        assert not validate_trade_review(doge_ai,doge)
+        # A better justified plan for that same asset still passes.
+        doge_ai.tp1=0.090
+        doge_ai.tp2=0.094
         assert validate_trade_review(doge_ai,doge)
         doge_ai.confidence=70
         assert not validate_trade_review(doge_ai,doge)
@@ -1988,7 +2093,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
