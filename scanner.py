@@ -1863,11 +1863,46 @@ def pepito_selftest():
         assert not validate_trade_review(too_tight,candidate("NIGHT_USDT",1.0195))
         assert validate_trade_review(review("NIGHT_USDT"),candidate("NIGHT_USDT"))
         info=format_trade_alert(candidate("NIGHT_USDT"),review("NIGHT_USDT"))
-        assert "Potentiel net estimé" in info and "3 minutes maximum" in info
+        assert "Potentiel net estimé" in info and "15 min MAXIMUM" in info
+        assert "PRIX D'ACHAT MAXIMUM (LIMIT)" in info and "ACHAT LIMIT uniquement" in info
+        assert "3 minutes" not in info
         last_alert_at["ADA_USDT"]=now-12*3600
         assert not can_alert("ADA_USDT",now)
         assert can_alert("ADA_USDT",now+12*3600)
         last_alert_at.pop("ADA_USDT",None)
+
+        # V8: NEAR's historical narrow profit headroom is too fragile to
+        # preserve +2% net with a +0.25% ask drift (the actual phone screenshot).
+        near=AIReview("NEAR_USDT","TRADE",82,"real alert",
+                      5.0,5.01,4.95,5.18,5.40)
+        lo_near,cap_near=compute_entry_guardrails(near,"CONTINUATION",0.05)
+        assert 5.01 < cap_near < 5.0226 and lo_near < 5.01
+        assert not entry_has_headroom(near,"CONTINUATION",0.05)
+        cdc_pairs.add("NEAR_USD")
+        not_durable=candidate("NEAR_USDT",5.0072)
+        not_durable.style="CONTINUATION"
+        assert not validate_trade_review(near,not_durable)
+
+        # A stronger setup is actionable WITHOUT asking ChatGPT again:
+        # the bound allows a reasonable positive price drift while EVERY gate
+        # remains true even for an entry at the upper cap.
+        sturdy=AIReview("NEAR_USDT","TRADE",95,"strong fixture",
+                        5.00,5.01,4.95,5.28,5.60)
+        floor,cap=compute_entry_guardrails(sturdy,"CONTINUATION",0.05)
+        assert floor < 5.01 and cap >= 5.01*1.003
+        fees=ROUND_TRIP_FEE_PCT+EXECUTION_BUFFER_PCT
+        tp1_net=(sturdy.tp1/cap-1)*100-fees
+        tp2_net=(sturdy.tp2/cap-1)*100-fees
+        stop_risk=(cap-sturdy.invalidation)/cap*100+fees
+        assert tp1_net>=MIN_NET_TP1_PCT-1e-7
+        assert tp2_net>=MIN_NET_TP2_PCT-1e-7
+        assert tp2_net/stop_risk>=MIN_NET_REWARD_RISK-1e-7
+        assert (sturdy.tp1/(cap*1.01)-1)*100-fees < tp1_net
+        assert entry_has_headroom(sturdy,"CONTINUATION",0.05)
+        assert validate_trade_review(sturdy,not_durable)
+        slack_message=format_trade_alert(not_durable,sturdy)
+        assert "15 min MAXIMUM" in slack_message and "5.01" in slack_message
+        assert "AUCUN ORDRE AUTOMATIQUE" in slack_message
 
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
@@ -2053,7 +2088,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
