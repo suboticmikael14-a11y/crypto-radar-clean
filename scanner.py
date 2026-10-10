@@ -21,6 +21,15 @@ CDC_CANDLES_URL = "https://api.crypto.com/exchange/v1/public/get-candlestick"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "150000"))
 MIN_WATCH_24H_QUOTE_VOL = float(os.getenv("MIN_WATCH_24H_QUOTE_VOL", "10000"))
+# Independent HIGH-RISK discovery: never loosen the V8 TRADE execution gate.
+SPEC_ENABLED = os.getenv("SPEC_ENABLED", "1").lower() in {"1","true","yes","on"}
+SPEC_MIN_RET5_PCT = float(os.getenv("SPEC_MIN_RET5_PCT", "1.20"))
+SPEC_FAST_RET1_PCT = float(os.getenv("SPEC_FAST_RET1_PCT", "0.75"))
+SPEC_MIN_RECENT_VOLUME_USD = float(os.getenv("SPEC_MIN_RECENT_VOLUME_USD", "0.01"))
+SPEC_MAX_SPREAD_PCT = float(os.getenv("SPEC_MAX_SPREAD_PCT", "25.0"))
+SPEC_ALERTS_PER_SCAN = int(os.getenv("SPEC_ALERTS_PER_SCAN", "2"))
+SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "8"))
+SPEC_PAIR_COOLDOWN_MIN = int(os.getenv("SPEC_PAIR_COOLDOWN_MIN", "480"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -102,6 +111,8 @@ session.headers.update({"Accept": "application/json", "User-Agent": "crypto-rada
 
 history = defaultdict(lambda: deque(maxlen=HISTORY_MAX_MIN + 10))
 last_alert_at = {}
+last_spec_alert_at = {}
+spec_candidates = {}
 pilots = {}
 slack_blocked_until = 0.0
 last_slack_send_at = 0.0
@@ -144,6 +155,12 @@ def init_state_db():
         pair TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)""")
     _state_db.execute("""CREATE TABLE IF NOT EXISTS sent_trades (
         pair TEXT PRIMARY KEY, sent_at REAL NOT NULL)""")
+    _state_db.execute("""CREATE TABLE IF NOT EXISTS sent_spec_alerts (
+        pair TEXT PRIMARY KEY, sent_at REAL NOT NULL)""")
+    for pair, sent_at in _state_db.execute(
+        "SELECT pair,sent_at FROM sent_spec_alerts WHERE sent_at >= ?", (time.time()-7*86400,)
+    ).fetchall():
+        last_spec_alert_at[pair] = float(sent_at)
     for pair, sent_at in _state_db.execute(
         "SELECT pair,sent_at FROM sent_trades WHERE sent_at >= ?", (time.time()-7*86400,)
     ).fetchall():
@@ -195,6 +212,16 @@ def mark_trade_sent(pair, timestamp):
         _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
         _state_db.execute("""INSERT INTO sent_trades(pair,sent_at) VALUES (?,?)
             ON CONFLICT(pair) DO UPDATE SET sent_at=excluded.sent_at""", (pair, timestamp))
+        _state_db.commit()
+
+
+def mark_spec_sent(pair, timestamp):
+    """Independent persistent cooldown; NEVER delete pilots or block a later TRADE."""
+    last_spec_alert_at[pair] = timestamp
+    spec_candidates.pop(pair, None)
+    if _state_db is not None:
+        _state_db.execute("""INSERT INTO sent_spec_alerts(pair,sent_at) VALUES (?,?)
+            ON CONFLICT(pair) DO UPDATE SET sent_at=excluded.sent_at""", (pair,timestamp))
         _state_db.commit()
 
 
@@ -623,6 +650,8 @@ def cdc_candle_metrics(pair, now=None):
         ratio = min(80.0, max(0.0, ratio))
         metrics = {
             "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "volume_5m_usd_est": sum(values[-5:]),
+            "closed_at": fnum(closed[-1]["t"])/1000.0,
             "atr_1m_pct": median_true_range_pct,
             "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
