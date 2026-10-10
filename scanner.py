@@ -2152,6 +2152,16 @@ def pepito_coverage_audit():
               for x in raw if str(x.get("i","")).upper() in listed]
         live=bypair.get(symbol+"_USDT")
         candle=cdc_candle_metrics(symbol+"_USDT") if live else None
+        if live and symbol in ("OP","MAGIC","CAP"):
+            try:
+                response=session.get(CDC_TICKERS_URL.replace("get-tickers","get-book"),
+                    params={"instrument_name":live["exchange_symbol"],"depth":"10"},
+                    timeout=HTTP_TIMEOUT)
+                response.raise_for_status()
+                bp=response.json()
+                print("V9 BOOK — "+symbol+" | "+json.dumps(bp.get("result",{}),ensure_ascii=False)[:900],flush=True)
+            except Exception as exc:
+                print(f"V9 BOOK ERROR — {symbol} {type(exc).__name__}: {exc}",flush=True)
         ready=bool(live and candle and candle["age_sec"]<=CANDLE_MIN_FRESH_SEC)
         reasons=[]
         if not listed:reasons.append("NOT_ON_EXCHANGE_SPOT")
