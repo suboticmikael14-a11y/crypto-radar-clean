@@ -2067,37 +2067,66 @@ def run():
 
             speculative_sent = 0
             speculative_quoted = 0
+            speculative_book_ok = 0
+            selective_rejects = Counter()
             if speculative_ready and SPEC_ENABLED:
+                # Every candidate is still detected. Slack promotion is separate.
+                selective_ready=[]
+                for pair,item,candle in speculative_ready:
+                    reason=speculative_notification_precheck(item,candle)
+                    if reason:
+                        selective_rejects[reason]+=1
+                    else:
+                        selective_ready.append((pair,item,candle))
                 hour_count=sum(1 for ts in last_spec_alert_at.values() if ts>=now-3600)
                 slots=max(0,min(SPEC_ALERTS_PER_SCAN,SPEC_ALERTS_PER_HOUR-hour_count))
-                for pair,item,candle in speculative_ready[:slots]:
-                    # Existing classical TRADE may have been sent this scan.
+                book_checks=0
+                for pair,item,candle in selective_ready:
+                    if speculative_sent>=slots or book_checks>=SPEC_BOOK_CHECKS_PER_SCAN:
+                        break
                     if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
                         continue
-                    # Recompute candle age AFTER a potentially long AI review.
+                    # Recheck freshness after V8 AI; old candles never notify.
                     live_candle=dict(candle)
                     live_candle["age_sec"]=time.time()-fnum(candle.get("closed_at"))-60
                     if live_candle["age_sec"]>CANDLE_MIN_FRESH_SEC:
+                        selective_rejects["stale_candle"]+=1
                         continue
                     live=speculative_live_requote(pair,item)
-                    if not live or not speculative_evidence(live,live_candle):
+                    if not live:
+                        selective_rejects["ticker_requote_failed"]+=1
+                        continue
+                    reason=speculative_notification_precheck(live,live_candle)
+                    if reason:
+                        selective_rejects["requote_"+reason]+=1
                         continue
                     speculative_quoted+=1
-                    msg=speculative_message(pair,live,candle)
+                    book_checks+=1
+                    quality=speculative_fetch_book(pair,live)
+                    if quality is None:
+                        selective_rejects["book_depth_or_impact"]+=1
+                        continue
+                    speculative_book_ok+=1
+                    msg=speculative_message(pair,live,candle,quality)
                     if SLACK_ENABLED and SLACK_WEBHOOK_URL:
                         if send_slack_once(msg):
                             mark_spec_sent(pair,time.time())
                             speculative_sent+=1
-                            print(f"V9 MICROCAP SLACK — {pair} | qv24={live['quote_volume']:.0f} "
-                                  f"r5={candle['r5']:+.2f}% | spread high risk",flush=True)
+                            print(f"V9B SPEC SLACK — {pair} | r5={candle['r5']:+.2f}% "
+                                  f"v5={candle['volume_5m_usd_est']:.0f} USD "
+                                  f"cross={quality['cross_pct']:.2f}% | book verified",flush=True)
                     else:
-                        print(f"V9 MICROCAP TEST — {pair} | no Slack",flush=True)
-                if len(speculative_ready)>slots:
-                    print(f"V9 MICROCAP BACKLOG — {len(speculative_ready)-slots} attente "
-                          f"(plafond horaire/scan, aucune suppression)",flush=True)
-            print(f"V9 SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
+                        print(f"V9B SPEC TEST — {pair} | verified book, Slack OFF",flush=True)
+                if len(selective_ready)>book_checks:
+                    print(f"V9B SPEC PENDING — eligible={len(selective_ready)} "
+                          f"book_checks={book_checks} | limit/cooldown active",flush=True)
+            if selective_rejects:
+                print("V9B SELECTIVE REJETS — "+" | ".join(
+                    f"{k}={n}" for k,n in selective_rejects.most_common()),flush=True)
+            print(f"V9B SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
                   f"IMPULSES {speculative_seen} -> 2X CONFIRMED {len(speculative_ready)} "
-                  f"-> LIVE REQUOTE {speculative_quoted} -> SLACK {speculative_sent}",flush=True)
+                  f"-> LIVE REQUOTE {speculative_quoted} -> BOOK OK {speculative_book_ok} "
+                  f"-> SLACK {speculative_sent}",flush=True)
             if gate_rejections:
                 print("PEPITO REJETS — " + " | ".join(
                     f"{name}={count}" for name, count in gate_rejections.most_common()
