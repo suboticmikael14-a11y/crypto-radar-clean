@@ -1798,7 +1798,7 @@ def speculative_fetch_book(pair,live):
         return None
 
 
-def speculative_message(pair, item, candle):
+def speculative_message(pair, item, candle, book=None):
     """High-risk RADAR, NEVER a V8 TRADE-approved instruction."""
     price=fnum(item.get("last"))
     bid=fnum(item.get("highest_bid"))
@@ -1807,20 +1807,30 @@ def speculative_message(pair, item, candle):
     qv=fnum(item.get("quote_volume"))
     mv=fnum(candle.get("volume_5m_usd_est"))
     sym=item.get("exchange_symbol","")
+    book_text=(
+        f"Carnet vérifié pour {book['size_usd']:.0f} USD : écart achat-revente "
+        f"estimé {book['cross_pct']:.2f}% AVANT FRAIS | "
+        f"achat moyen simulé {book['avg_buy']:.10g} USD | "
+        f"revente moyenne simulée {book['avg_sell']:.10g} USD\n"
+        if book else ""
+    )
     risk=("EXTRÊME — carnet très large, vente potentiellement difficile"
           if spread>=3 or mv<100 else "TRÈS ÉLEVÉ — liquidité limitée")
     return (
-        f"🚀 PEPITO — MICROCAP SPÉCULATIVE | RISQUE TRÈS ÉLEVÉ\n"
+        f"🚀 PEPITO — MICROCAP SPÉCULATIVE FILTRÉE | RISQUE ÉLEVÉ\n"
         f"{pair} | Crypto.com Exchange Spot : {sym}\n"
-        f"Prix indicatif : {price:.10g} USD | meilleure vente : {ask:.10g} USD\n"
+        f"Prix indicatif : {price:.10g} USD | meilleure offre de vente (ask) : {ask:.10g} USD\n"
         f"Variation 1m : {fnum(candle.get('r1')):+.2f}% | 5m : {fnum(candle.get('r5')):+.2f}% "
         f"| 15m : {fnum(candle.get('r15')):+.2f}% | 24h : {fnum(item.get('change_percentage')):+.2f}%\n"
         f"Volume 24h Exchange : {qv:,.0f} USD | échanges 5m : {mv:,.2f} USD\n"
         f"Spread observé : {spread:.2f}% | RISQUE : {risk}\n"
-        f"⚠️ SIGNAL DE DÉTECTION, PAS TRADE VALIDÉ. AUCUN GAIN OU PRIX EXÉCUTABLE GARANTI.\n"
+        f"{book_text}"
+        f"⚠️ CANDIDAT SPÉCULATIF FILTRÉ, PAS TRADE VALIDÉ. "
+        f"Le carnet peut disparaître ; prix et gains NON GARANTIS.\n"
         f"⚠️ Si tu envisages une entrée, vérifie le carnet et utilise uniquement un ordre LIMIT. "
         f"Le spread et le manque d'acheteurs peuvent empêcher toute sortie.\n"
-        f"Pas de signal de stop/TP fiable sur ce carnet. AUCUN ORDRE AUTOMATIQUE."
+        f"Stop/TP non validés : ne pas entrer sans plan de sortie. "
+        f"AUCUN ORDRE AUTOMATIQUE."
     )
 
 
@@ -1860,7 +1870,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
+        f"VALIDATION V9B ACTIVE — CDC SPOT->MICROCAP FILTRÉE+CARNET + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack={'TRADE_PLUS_SPEC' if SPEC_ENABLED else 'TRADE_ONLY'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
