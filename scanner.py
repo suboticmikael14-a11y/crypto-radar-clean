@@ -1919,8 +1919,12 @@ def pepito_selftest():
         assert not validate_trade_review(doge_ai,doge)
         doge.signal.ret_5m=0.35
         doge.signal.ret_15m=0.65
-        # A genuinely reaccelerating setup with identical cost geometry is
-        # not suppressed for simply being called DOGE.
+        # V8 rejects even a reacceleration if net upside has virtually no
+        # room for a human to open CDC; this is intentional, not a DOGE ban.
+        assert not validate_trade_review(doge_ai,doge)
+        # A better justified plan for that same asset still passes.
+        doge_ai.tp1=0.090
+        doge_ai.tp2=0.094
         assert validate_trade_review(doge_ai,doge)
         doge_ai.confidence=70
         assert not validate_trade_review(doge_ai,doge)
