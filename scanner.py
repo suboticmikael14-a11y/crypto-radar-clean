@@ -1348,7 +1348,7 @@ def ai_review_batch(candidates):
     return best, reviews
 
 
-def compute_entry_guardrails(review: AIReview):
+def compute_entry_guardrails(review: AIReview, style="MOMENTUM", atr_pct=0.0):
     """Conservative entry limits, valid only while the original signal is fresh.
 
     Calculations use the worst-case intended BUY price and reserve round-trip
@@ -1369,7 +1369,14 @@ def compute_entry_guardrails(review: AIReview):
     # (tp2/x-1-cost) >= rr * ((x-inv)/x+cost)
     max_rr = (tp2 + rr*inv)/(1.0 + rr + (rr+1.0)*cost)
     hard_cap = min(max_tp1,max_tp2,max_rr,hi*(1.0+ENTRY_EXTENSION_MAX_PCT/100.0))
-    floor = max(inv*(1.0+0.0001),lo*(1.0-ENTRY_PULLBACK_MAX_PCT/100.0))
+    min_stop = (MIN_STOP_SWING_PCT if style=="SWING_ACCUMULATION" else
+                MIN_STOP_CONTINUATION_PCT if style=="CONTINUATION" else
+                MIN_STOP_MOMENTUM_PCT)
+    min_stop = max(min_stop, STOP_ATR_MULTIPLE * max(0.0, fnum(atr_pct)))
+    if min_stop >= 90:
+        return None
+    floor = max(inv/(1.0-min_stop/100.0),
+                lo*(1.0-ENTRY_PULLBACK_MAX_PCT/100.0))
     if not (floor <= hi <= hard_cap):
         return None
     # Round max BUY price DOWN (never up past the net-profit threshold).
@@ -1380,9 +1387,9 @@ def compute_entry_guardrails(review: AIReview):
     return (floor,cap)
 
 
-def entry_has_headroom(review: AIReview) -> bool:
+def entry_has_headroom(review: AIReview, style="MOMENTUM", atr_pct=0.0) -> bool:
     """Don't notify just-barely-valid opportunities that expire on a tiny uptick."""
-    band = compute_entry_guardrails(review)
+    band = compute_entry_guardrails(review, style, atr_pct)
     return band is not None and band[1] >= review.entry_high * (1.0 + MIN_ENTRY_HEADROOM_PCT/100.0)
 
 
@@ -1431,7 +1438,7 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             f"risk={risk:.2f}% RR_net={net_rr:.2f} reserve_frais={costs_pct:.2f}%")
     if net_tp1 < MIN_NET_TP1_PCT or net_tp2 < MIN_NET_TP2_PCT or net_rr < MIN_NET_REWARD_RISK:
         return deny("net_profit_or_reward_risk",detail)
-    if not entry_has_headroom(review):
+    if not entry_has_headroom(review,c.style):
         return deny("no_practical_entry_headroom",
                     f"need_extension={MIN_ENTRY_HEADROOM_PCT:.2f}% under true net TP1/TP2/RR caps")
     # Start with a style-dependent minimum stop; live data will increase the
@@ -1465,6 +1472,9 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
             return deny("live_closed_candle_momentum_not_confirmed",
                         f"r5={m['r5']:+.2f}% r15={m['r15']:+.2f}%")
         min_stop = max(min_stop, STOP_ATR_MULTIPLE*atr_pct)
+        if not entry_has_headroom(review,c.style,atr_pct):
+            return deny("no_practical_entry_after_volatility",
+                        f"min_stop={min_stop:.2f}%")
         if stop_distance_pct < min_stop:
             return deny("stop_under_normal_volatility",
                         f"stop={stop_distance_pct:.2f}% min={min_stop:.2f}% "
@@ -1505,33 +1515,41 @@ def validate_trade_review(review: AIReview, c: ConfirmedCandidate) -> bool:
 
 def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
     s = c.signal
-    hi = review.entry_high
+    m = candle_cache.get(s.pair,(0,{}))[1] or {}
+    entry_range = compute_entry_guardrails(review,c.style,m.get("atr_1m_pct",0.0))
+    if entry_range is None:
+        raise ValueError("entry risk band failed closed before Slack")
+    entry_floor, entry_cap = entry_range
     costs = max(0.0,ROUND_TRIP_FEE_PCT)+max(0.0,EXECUTION_BUFFER_PCT)
-    net1 = (review.tp1/hi-1)*100-costs
-    net2 = (review.tp2/hi-1)*100-costs
-    risk = (hi-review.invalidation)/hi*100+costs
+    net1 = (review.tp1/entry_cap-1)*100-costs
+    net2 = (review.tp2/entry_cap-1)*100-costs
+    risk = (entry_cap-review.invalidation)/entry_cap*100+costs
     rr = net2/risk if risk>0 else 0.0
     return (
-        f"PEPITO — ENTRÉE QUALIFIÉE, PRIX À RESPECTER\n"
+        f"PEPITO — TRADE VALIDÉ AU MOMENT DE L'ALERTE | ACHAT LIMIT MANUEL\n"
         f"{s.pair}\n\n"
         f"Style : {c.style}\n"
         f"Horizon : {'1-7 jours' if c.style == 'SWING_ACCUMULATION' else '1h-48h' if c.style == 'CONTINUATION' else '30m-6h'}\n"
         f"Marché de référence : {cdc_ticker_by_pair.get(s.pair, {}).get('exchange_symbol','Crypto.com Exchange')}\n"
         f"Prix actuel : {s.price:.10g}\n"
-        f"Zone d'entrée : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
-        f"Invalidation : {review.invalidation:.10g}\n"
+        f"Zone initiale IA : {review.entry_low:.10g} → {review.entry_high:.10g}\n"
+        f"PRIX D'ACHAT MAXIMUM (LIMIT) : {entry_cap:.10g} USD\n"
+        f"Bande de contrôle à l'achat : {entry_floor:.10g} → {entry_cap:.10g} USD\n"
+        f"Invalidation (stop) : {review.invalidation:.10g}\n"
         f"TP1 : {review.tp1:.10g}\n"
         f"TP2 : {review.tp2:.10g}\n"
         f"Confiance IA : {review.confidence}/100\n"
-        f"Potentiel net estimé après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
-        f"Perte stop coûts inclus (est.) : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
+        f"Potentiel net estimé AU PRIX MAX après coûts : TP1 {net1:+.2f}% | TP2 {net2:+.2f}%\n"
+        f"Perte stop coûts inclus (est.) AU PRIX MAX : {risk:.2f}% | Ratio rendement/risque net : {rr:.2f}\n\n"
         f"Pourquoi : {review.reason}\n\n"
         f"Trajectoire : +{c.price_gain:.2f}% depuis pilote | score {s.score}/100 | "
         f"vol x{s.vol_ratio:.1f} | r5 {s.ret_5m:+.2f}% | r15 {s.ret_15m:+.2f}% | "
         f"spread {s.spread_pct:.3f}%\n"
-        f"⚠️ Valable 3 minutes maximum ET uniquement si l'ask Exchange est dans la zone d'entrée.\n"
-        f"⚠️ Si le prix sort de la zone ou franchit l'invalidation, PAS D'ACHAT.\n"
-        f"Frais et glissement estimés, profits non garantis.\n"
+        f"✅ Fenêtre de décision : {SIGNAL_ENTRY_WINDOW_MIN} min MAXIMUM après réception, pas un achat garanti.\n"
+        f"⚠️ ACHAT LIMIT uniquement : vérifier que l'ask Crypto.com est dans la bande de contrôle.\n"
+        f"⚠️ Au-dessus du plafond, sous le plancher, sous le stop ou après la fenêtre : PAS D'ACHAT.\n"
+        f"⚠️ Si le mouvement s'inverse franchement ou la liquidité disparaît : PAS D'ACHAT.\n"
+        f"Frais et glissement estimés, profits non garantis. AUCUN ORDRE AUTOMATIQUE.\n"
         f"Source prix/volume : Crypto.com Exchange (Spot) | Gate.io : auxiliaire"
     )
 
