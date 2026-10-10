@@ -28,7 +28,16 @@ SPEC_FAST_RET1_PCT = float(os.getenv("SPEC_FAST_RET1_PCT", "0.75"))
 SPEC_MIN_RECENT_VOLUME_USD = float(os.getenv("SPEC_MIN_RECENT_VOLUME_USD", "0.01"))
 SPEC_MAX_SPREAD_PCT = float(os.getenv("SPEC_MAX_SPREAD_PCT", "25.0"))
 SPEC_ALERTS_PER_SCAN = int(os.getenv("SPEC_ALERTS_PER_SCAN", "2"))
-SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "30"))
+SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "8"))
+# V9B: detect broadly, but notify only after tradeability checks.
+SPEC_NOTIFY_RET5_PCT = float(os.getenv("SPEC_NOTIFY_RET5_PCT", "3.0"))
+SPEC_NOTIFY_VOL5_USD = float(os.getenv("SPEC_NOTIFY_VOL5_USD", "300"))
+SPEC_NOTIFY_MAX_SPREAD_PCT = float(os.getenv("SPEC_NOTIFY_MAX_SPREAD_PCT", "2.0"))
+SPEC_BOOK_NOTIONAL_USD = float(os.getenv("SPEC_BOOK_NOTIONAL_USD", "200"))
+SPEC_BOOK_PRICE_BAND_PCT = float(os.getenv("SPEC_BOOK_PRICE_BAND_PCT", "2.0"))
+SPEC_BOOK_MAX_CROSS_PCT = float(os.getenv("SPEC_BOOK_MAX_CROSS_PCT", "2.5"))
+SPEC_BOOK_CHECKS_PER_SCAN = int(os.getenv("SPEC_BOOK_CHECKS_PER_SCAN", "6"))
+CDC_BOOK_URL = "https://api.crypto.com/exchange/v1/public/get-book"
 SPEC_PAIR_COOLDOWN_MIN = int(os.getenv("SPEC_PAIR_COOLDOWN_MIN", "480"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
@@ -1680,7 +1689,116 @@ def speculative_confirm(pair, item, candle, now):
     return True
 
 
-def speculative_message(pair, item, candle):
+def speculative_notification_precheck(item,candle):
+    """V9B: detect ALL microcaps; notify only selective, recent candidates."""
+    if not speculative_evidence(item,candle):
+        return "no_current_impulse"
+    if fnum(candle.get("r5")) < SPEC_NOTIFY_RET5_PCT:
+        return "r5_under_3pct"
+    if fnum(candle.get("r15")) < 0.5:
+        return "r15_negative"
+    if fnum(candle.get("volume_5m_usd_est")) < SPEC_NOTIFY_VOL5_USD:
+        return "trading_5m_under_300_usd"
+    ask=fnum(item.get("lowest_ask"))
+    bid=fnum(item.get("highest_bid"))
+    if ask<=0 or bid<=0 or ask<=bid:
+        return "invalid_bid_ask"
+    spread=(ask-bid)/((ask+bid)/2)*100
+    if spread > SPEC_NOTIFY_MAX_SPREAD_PCT:
+        return "spread_above_2pct"
+    return None
+
+
+def speculative_book_quality(snapshot, notional=None):
+    """Simulate $200 market depth on BOTH sides, no fake executable liquidity."""
+    notional = SPEC_BOOK_NOTIONAL_USD if notional is None else float(notional)
+    if not isinstance(snapshot,dict) or notional<=0:
+        return None
+    def levels(side, reverse):
+        raw=snapshot.get(side)
+        if not isinstance(raw,list):
+            return []
+        parsed=[]
+        for level in raw:
+            if not isinstance(level,(list,tuple)) or len(level)<2:
+                continue
+            px=fnum(level[0])
+            qty=fnum(level[1])
+            if px>0 and qty>0:
+                parsed.append((px,qty))
+        return sorted(parsed,key=lambda z:z[0],reverse=reverse)
+    bids=levels("bids",True)
+    asks=levels("asks",False)
+    if not bids or not asks:
+        return None
+    best_bid,best_ask=bids[0][0],asks[0][0]
+    if best_bid>=best_ask:
+        return None
+    spread=100*(best_ask-best_bid)/((best_ask+best_bid)/2)
+    if spread>SPEC_NOTIFY_MAX_SPREAD_PCT:
+        return None
+    target_qty=notional/best_ask
+    def execute(book,is_buy):
+        remaining=target_qty
+        value=0.0
+        filled=0.0
+        for price,qty in book:
+            if is_buy and price>best_ask*(1+SPEC_BOOK_PRICE_BAND_PCT/100):
+                break
+            if not is_buy and price<best_bid*(1-SPEC_BOOK_PRICE_BAND_PCT/100):
+                break
+            current=min(remaining,qty)
+            value+=current*price
+            filled+=current
+            remaining-=current
+            if remaining<=1e-10*target_qty:
+                break
+        if remaining>1e-8*target_qty or filled<=0:
+            return None
+        return value/filled
+    buy_avg=execute(asks,True)
+    sell_avg=execute(bids,False)
+    if not buy_avg or not sell_avg:
+        return None
+    cross=100*(buy_avg/sell_avg-1)
+    if cross<0 or cross>SPEC_BOOK_MAX_CROSS_PCT:
+        return None
+    return {"best_bid":best_bid,"best_ask":best_ask,
+            "spread_pct":spread,"avg_buy":buy_avg,"avg_sell":sell_avg,
+            "cross_pct":cross,"size_usd":notional}
+
+
+def speculative_fetch_book(pair,live):
+    """Real official Crypto.com Spot orderbook; no synthetic substitute."""
+    instrument=live.get("exchange_symbol")
+    if not instrument or not cdc_tradeable(pair):
+        return None
+    try:
+        r=session.get(CDC_BOOK_URL,params={"instrument_name":instrument,"depth":"50"},timeout=8)
+        r.raise_for_status()
+        body=r.json()
+        if body.get("code")!=0:
+            return None
+        result=body.get("result",{})
+        if result.get("instrument_name")!=instrument:
+            return None
+        data=result.get("data",[])
+        if not isinstance(data,list) or not data:
+            return None
+        quality=speculative_book_quality(data[0])
+        if not quality:
+            return None
+        for book_px,quote_px in (("best_ask","lowest_ask"),("best_bid","highest_bid")):
+            ticker_px=fnum(live.get(quote_px))
+            if ticker_px<=0 or abs(quality[book_px]/ticker_px-1)>0.01:
+                return None
+        return quality
+    except Exception as exc:
+        print(f"V9B BOOK ERROR — {pair} | {type(exc).__name__}",flush=True)
+        return None
+
+
+def speculative_message(pair, item, candle, book=None):
     """High-risk RADAR, NEVER a V8 TRADE-approved instruction."""
     price=fnum(item.get("last"))
     bid=fnum(item.get("highest_bid"))
@@ -1689,20 +1807,30 @@ def speculative_message(pair, item, candle):
     qv=fnum(item.get("quote_volume"))
     mv=fnum(candle.get("volume_5m_usd_est"))
     sym=item.get("exchange_symbol","")
+    book_text=(
+        f"Carnet vérifié pour {book['size_usd']:.0f} USD : écart achat-revente "
+        f"estimé {book['cross_pct']:.2f}% AVANT FRAIS | "
+        f"achat moyen simulé {book['avg_buy']:.10g} USD | "
+        f"revente moyenne simulée {book['avg_sell']:.10g} USD\n"
+        if book else ""
+    )
     risk=("EXTRÊME — carnet très large, vente potentiellement difficile"
           if spread>=3 or mv<100 else "TRÈS ÉLEVÉ — liquidité limitée")
     return (
-        f"🚀 PEPITO — MICROCAP SPÉCULATIVE | RISQUE TRÈS ÉLEVÉ\n"
+        f"🚀 PEPITO — MICROCAP SPÉCULATIVE FILTRÉE | RISQUE ÉLEVÉ\n"
         f"{pair} | Crypto.com Exchange Spot : {sym}\n"
-        f"Prix indicatif : {price:.10g} USD | meilleure vente : {ask:.10g} USD\n"
+        f"Prix indicatif : {price:.10g} USD | meilleure offre de vente (ask) : {ask:.10g} USD\n"
         f"Variation 1m : {fnum(candle.get('r1')):+.2f}% | 5m : {fnum(candle.get('r5')):+.2f}% "
         f"| 15m : {fnum(candle.get('r15')):+.2f}% | 24h : {fnum(item.get('change_percentage')):+.2f}%\n"
         f"Volume 24h Exchange : {qv:,.0f} USD | échanges 5m : {mv:,.2f} USD\n"
         f"Spread observé : {spread:.2f}% | RISQUE : {risk}\n"
-        f"⚠️ SIGNAL DE DÉTECTION, PAS TRADE VALIDÉ. AUCUN GAIN OU PRIX EXÉCUTABLE GARANTI.\n"
+        f"{book_text}"
+        f"⚠️ CANDIDAT SPÉCULATIF FILTRÉ, PAS TRADE VALIDÉ. "
+        f"Le carnet peut disparaître ; prix et gains NON GARANTIS.\n"
         f"⚠️ Si tu envisages une entrée, vérifie le carnet et utilise uniquement un ordre LIMIT. "
         f"Le spread et le manque d'acheteurs peuvent empêcher toute sortie.\n"
-        f"Pas de signal de stop/TP fiable sur ce carnet. AUCUN ORDRE AUTOMATIQUE."
+        f"Stop/TP non validés : ne pas entrer sans plan de sortie. "
+        f"AUCUN ORDRE AUTOMATIQUE."
     )
 
 
@@ -1742,7 +1870,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
+        f"VALIDATION V9B ACTIVE — CDC SPOT->MICROCAP FILTRÉE+CARNET + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack={'TRADE_PLUS_SPEC' if SPEC_ENABLED else 'TRADE_ONLY'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1939,37 +2067,66 @@ def run():
 
             speculative_sent = 0
             speculative_quoted = 0
+            speculative_book_ok = 0
+            selective_rejects = Counter()
             if speculative_ready and SPEC_ENABLED:
+                # Every candidate is still detected. Slack promotion is separate.
+                selective_ready=[]
+                for pair,item,candle in speculative_ready:
+                    reason=speculative_notification_precheck(item,candle)
+                    if reason:
+                        selective_rejects[reason]+=1
+                    else:
+                        selective_ready.append((pair,item,candle))
                 hour_count=sum(1 for ts in last_spec_alert_at.values() if ts>=now-3600)
                 slots=max(0,min(SPEC_ALERTS_PER_SCAN,SPEC_ALERTS_PER_HOUR-hour_count))
-                for pair,item,candle in speculative_ready[:slots]:
-                    # Existing classical TRADE may have been sent this scan.
+                book_checks=0
+                for pair,item,candle in selective_ready:
+                    if speculative_sent>=slots or book_checks>=SPEC_BOOK_CHECKS_PER_SCAN:
+                        break
                     if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
                         continue
-                    # Recompute candle age AFTER a potentially long AI review.
+                    # Recheck freshness after V8 AI; old candles never notify.
                     live_candle=dict(candle)
                     live_candle["age_sec"]=time.time()-fnum(candle.get("closed_at"))-60
                     if live_candle["age_sec"]>CANDLE_MIN_FRESH_SEC:
+                        selective_rejects["stale_candle"]+=1
                         continue
                     live=speculative_live_requote(pair,item)
-                    if not live or not speculative_evidence(live,live_candle):
+                    if not live:
+                        selective_rejects["ticker_requote_failed"]+=1
+                        continue
+                    reason=speculative_notification_precheck(live,live_candle)
+                    if reason:
+                        selective_rejects["requote_"+reason]+=1
                         continue
                     speculative_quoted+=1
-                    msg=speculative_message(pair,live,candle)
+                    book_checks+=1
+                    quality=speculative_fetch_book(pair,live)
+                    if quality is None:
+                        selective_rejects["book_depth_or_impact"]+=1
+                        continue
+                    speculative_book_ok+=1
+                    msg=speculative_message(pair,live,candle,quality)
                     if SLACK_ENABLED and SLACK_WEBHOOK_URL:
                         if send_slack_once(msg):
                             mark_spec_sent(pair,time.time())
                             speculative_sent+=1
-                            print(f"V9 MICROCAP SLACK — {pair} | qv24={live['quote_volume']:.0f} "
-                                  f"r5={candle['r5']:+.2f}% | spread high risk",flush=True)
+                            print(f"V9B SPEC SLACK — {pair} | r5={candle['r5']:+.2f}% "
+                                  f"v5={candle['volume_5m_usd_est']:.0f} USD "
+                                  f"cross={quality['cross_pct']:.2f}% | book verified",flush=True)
                     else:
-                        print(f"V9 MICROCAP TEST — {pair} | no Slack",flush=True)
-                if len(speculative_ready)>slots:
-                    print(f"V9 MICROCAP BACKLOG — {len(speculative_ready)-slots} attente "
-                          f"(plafond horaire/scan, aucune suppression)",flush=True)
-            print(f"V9 SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
+                        print(f"V9B SPEC TEST — {pair} | verified book, Slack OFF",flush=True)
+                if len(selective_ready)>book_checks:
+                    print(f"V9B SPEC PENDING — eligible={len(selective_ready)} "
+                          f"book_checks={book_checks} | limit/cooldown active",flush=True)
+            if selective_rejects:
+                print("V9B SELECTIVE REJETS — "+" | ".join(
+                    f"{k}={n}" for k,n in selective_rejects.most_common()),flush=True)
+            print(f"V9B SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
                   f"IMPULSES {speculative_seen} -> 2X CONFIRMED {len(speculative_ready)} "
-                  f"-> LIVE REQUOTE {speculative_quoted} -> SLACK {speculative_sent}",flush=True)
+                  f"-> LIVE REQUOTE {speculative_quoted} -> BOOK OK {speculative_book_ok} "
+                  f"-> SLACK {speculative_sent}",flush=True)
             if gate_rejections:
                 print("PEPITO REJETS — " + " | ".join(
                     f"{name}={count}" for name, count in gate_rejections.most_common()
@@ -2127,6 +2284,33 @@ def pepito_selftest():
             {"last":1,"highest_bid":0.99,"lowest_ask":1.01,
              "quote_volume":600000},dict(impulse))
         assert MIN_24H_QUOTE_VOL>=500000
+
+        # V9B regression: V9 detects all movements, Slack promotes very few.
+        def spec_item(spread, qv=1500):
+            return {"currency_pair":"SPEC_USDT","exchange_symbol":"SPEC_USD",
+                    "last":1.0,"highest_bid":1.0-spread/200,
+                    "lowest_ask":1.0+spread/200,
+                    "quote_volume":qv}
+        base_candle={"age_sec":15,"closed_at":now-60,
+                     "volume_5m_usd_est":500,"r1":0.2,"r5":4.3,"r15":5.2}
+        assert speculative_evidence(spec_item(1.0),dict(base_candle,volume_5m_usd_est=3))
+        assert speculative_notification_precheck(spec_item(1.0),base_candle) is None
+        assert speculative_notification_precheck(spec_item(1.0),dict(base_candle,r5=1.5))
+        assert speculative_notification_precheck(spec_item(1.0),dict(base_candle,volume_5m_usd_est=22))
+        assert speculative_notification_precheck(spec_item(9.8),base_candle)
+        # $200 BOTH ways at tight prices: accepted; old fake $20 books blocked.
+        enough={"asks":[[1.01,700],[1.015,700]],"bids":[[1.0,700],[0.995,700]]}
+        qual=speculative_book_quality(enough)
+        assert qual and 0<qual["cross_pct"]<2.5
+        assert speculative_book_quality({"asks":[[1.01,1]],"bids":[[1.0,700]]}) is None
+        assert speculative_book_quality({"asks":[[1.01,700]],"bids":[[1.0,1]]}) is None
+        assert speculative_book_quality({"asks":[[1.02,700]],"bids":[[0.99,700]]}) is None
+        assert speculative_book_quality({"asks":[[1.01,1],[1.07,700]],
+                                         "bids":[[1.0,700]]}) is None
+        book_msg=speculative_message("SPEC_USDT",spec_item(1.0),base_candle,qual)
+        assert "MICROCAP SPÉCULATIVE FILTRÉE" in book_msg
+        assert "PAS TRADE VALIDÉ" in book_msg and "AUCUN ORDRE AUTOMATIQUE" in book_msg
+        assert "200 USD" in book_msg and "AVANT FRAIS" in book_msg
 
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
@@ -2316,7 +2500,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V9B_SELECTIVE_NOTIFY_BOOK_DEPTH | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
@@ -2354,8 +2538,42 @@ def pepito_integration_test():
           +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
 
 
+def pepito_spec_book_test():
+    """Read-only real Exchange API schema and two-sided liquidity test; no Slack."""
+    refresh_cdc_pairs()
+    tickers=fetch_tickers()
+    if len(tickers)<100:
+        raise AssertionError("CDC catalog unexpectedly low")
+    accepted=0
+    for sym in ("SUI","BTC","STRK","AURORA"):
+        pair=sym+"_USDT"
+        live=cdc_ticker_by_pair.get(pair)
+        if not live:
+            continue
+        r=session.get(CDC_BOOK_URL,
+                      params={"instrument_name":live["exchange_symbol"],"depth":"50"},
+                      timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        body=r.json()
+        assert body.get("code")==0, f"get-book unavailable: {pair}"
+        result=body.get("result",{})
+        assert result.get("instrument_name")==live["exchange_symbol"]
+        rows=result.get("data") or []
+        assert rows and isinstance(rows[0].get("bids"),list) and isinstance(rows[0].get("asks"),list)
+        quality=speculative_fetch_book(pair,live)
+        print(f"V9B LIVE BOOK — {pair} | levels bid={len(rows[0]['bids'])} "
+              f"ask={len(rows[0]['asks'])} | $200 accepted={bool(quality)} "
+              f"| best-bid={rows[0]['bids'][0][0] if rows[0]['bids'] else 'none'} "
+              f"| best-ask={rows[0]['asks'][0][0] if rows[0]['asks'] else 'none'}",flush=True)
+        accepted+=bool(quality)
+    assert accepted>=1, "No real book supports $200 two-sided checks; do not deploy"
+    print("V9B LIVE BOOK TEST — PASS, NO SLACK",flush=True)
+
+
 if __name__ == "__main__":
-    if os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
+    if os.getenv("PEPITO_SPEC_BOOK_TEST", "0").lower() in {"1","true","yes","on"}:
+        pepito_spec_book_test()
+    elif os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
         pepito_integration_test()
     elif os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
         pepito_selftest()
