@@ -1629,6 +1629,110 @@ def send_slack_once(message: str) -> bool:
         return False
 
 
+def speculative_evidence(item, candle):
+    """Independent price-impulse detector, including sub-$10k CDC Spot markets.
+
+    Deliberately ignores the V8 pilot/AI/trade liquidity limits, but requires
+    REAL fresh Exchange candles and a recent traded amount (even tiny).
+    A 24h top-gainer percentage alone is NOT a current buy opportunity.
+    """
+    if not SPEC_ENABLED or not item or not candle:
+        return False
+    if fnum(candle.get("age_sec"),9999)>CANDLE_MIN_FRESH_SEC:
+        return False
+    if fnum(candle.get("closed_at"))<=0 or fnum(candle.get("volume_5m_usd_est"))<SPEC_MIN_RECENT_VOLUME_USD:
+        return False
+    price=fnum(item.get("last"))
+    bid=fnum(item.get("highest_bid"))
+    ask=fnum(item.get("lowest_ask"))
+    qv=fnum(item.get("quote_volume"))
+    if not (price>0 and bid>0 and ask>=bid>0 and 0<qv<MIN_24H_QUOTE_VOL):
+        return False
+    spread=(ask-bid)/((ask+bid)/2)*100
+    if spread>SPEC_MAX_SPREAD_PCT:
+        return False
+    r1=fnum(candle.get("r1"))
+    r5=fnum(candle.get("r5"))
+    r15=fnum(candle.get("r15"))
+    return bool((r5>=SPEC_MIN_RET5_PCT and r15>=0.5)
+                or (r1>=SPEC_FAST_RET1_PCT and r5>=0.65 and r15>=0.25))
+
+
+def speculative_confirm(pair, item, candle, now):
+    """Two DISTINCT closed 1m candles must sustain the impulse before Slack."""
+    if not speculative_evidence(item,candle):
+        spec_candidates.pop(pair,None)
+        return False
+    if last_spec_alert_at.get(pair,0)+SPEC_PAIR_COOLDOWN_MIN*60>now:
+        return False
+    if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
+        return False
+    closed_ts=fnum(candle.get("closed_at"))
+    previous=spec_candidates.get(pair)
+    if previous is None or closed_ts<=0 or now-previous[0]>15*60:
+        spec_candidates[pair]=(now,closed_ts)
+        return False
+    first_seen, prior_candle=previous
+    if closed_ts <= prior_candle or now-first_seen<30:
+        return False
+    return True
+
+
+def speculative_message(pair, item, candle):
+    """High-risk RADAR, NEVER a V8 TRADE-approved instruction."""
+    price=fnum(item.get("last"))
+    bid=fnum(item.get("highest_bid"))
+    ask=fnum(item.get("lowest_ask"))
+    spread=100*(ask-bid)/((ask+bid)/2)
+    qv=fnum(item.get("quote_volume"))
+    mv=fnum(candle.get("volume_5m_usd_est"))
+    sym=item.get("exchange_symbol","")
+    risk=("EXTRÊME — carnet très large, vente potentiellement difficile"
+          if spread>=3 or mv<100 else "TRÈS ÉLEVÉ — liquidité limitée")
+    return (
+        f"🚀 PEPITO — MICROCAP SPÉCULATIVE | RISQUE TRÈS ÉLEVÉ\n"
+        f"{pair} | Crypto.com Exchange Spot : {sym}\n"
+        f"Prix indicatif : {price:.10g} USD | meilleure vente : {ask:.10g} USD\n"
+        f"Variation 1m : {fnum(candle.get('r1')):+.2f}% | 5m : {fnum(candle.get('r5')):+.2f}% "
+        f"| 15m : {fnum(candle.get('r15')):+.2f}% | 24h : {fnum(item.get('change_percentage')):+.2f}%\n"
+        f"Volume 24h Exchange : {qv:,.0f} USD | échanges 5m : {mv:,.2f} USD\n"
+        f"Spread observé : {spread:.2f}% | RISQUE : {risk}\n"
+        f"⚠️ SIGNAL DE DÉTECTION, PAS TRADE VALIDÉ. AUCUN GAIN OU PRIX EXÉCUTABLE GARANTI.\n"
+        f"⚠️ Si tu envisages une entrée, vérifie le carnet et utilise uniquement un ordre LIMIT. "
+        f"Le spread et le manque d'acheteurs peuvent empêcher toute sortie.\n"
+        f"Pas de signal de stop/TP fiable sur ce carnet. AUCUN ORDRE AUTOMATIQUE."
+    )
+
+
+def speculative_live_requote(pair, item):
+    """Live official Spot ask/bid immediately before a speculative notification."""
+    instrument=item.get("exchange_symbol")
+    if not instrument or not cdc_tradeable(pair):
+        return None
+    try:
+        r=session.get(CDC_TICKERS_URL,params={"instrument_name":instrument},timeout=8)
+        r.raise_for_status()
+        quotes=normalize_cdc_tickers(r.json(),{instrument},time.time())
+        if not quotes:
+            return None
+        live=quotes[0]
+        bid=fnum(live.get("highest_bid"))
+        ask=fnum(live.get("lowest_ask"))
+        old=fnum(item.get("last"))
+        new=fnum(live.get("last"))
+        if not (old>0 and new>0 and bid>0 and ask>=bid):
+            return None
+        # Fast reversal or extreme chase after scanner sample = no new signal.
+        if new/old<0.96 or new/old>1.08:
+            return None
+        if (ask-bid)/((ask+bid)/2)*100>SPEC_MAX_SPREAD_PCT:
+            return None
+        return live
+    except Exception as exc:
+        print(f"V9 REQUOTE ERROR — {pair} {type(exc).__name__}",flush=True)
+        return None
+
+
 def run():
     print(
         f"Crypto Radar Clean démarre | interval={SCAN_INTERVAL}s | "
