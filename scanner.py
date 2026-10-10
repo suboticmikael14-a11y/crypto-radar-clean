@@ -28,7 +28,16 @@ SPEC_FAST_RET1_PCT = float(os.getenv("SPEC_FAST_RET1_PCT", "0.75"))
 SPEC_MIN_RECENT_VOLUME_USD = float(os.getenv("SPEC_MIN_RECENT_VOLUME_USD", "0.01"))
 SPEC_MAX_SPREAD_PCT = float(os.getenv("SPEC_MAX_SPREAD_PCT", "25.0"))
 SPEC_ALERTS_PER_SCAN = int(os.getenv("SPEC_ALERTS_PER_SCAN", "2"))
-SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "30"))
+SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "8"))
+# V9B: detect broadly, but notify only after tradeability checks.
+SPEC_NOTIFY_RET5_PCT = float(os.getenv("SPEC_NOTIFY_RET5_PCT", "3.0"))
+SPEC_NOTIFY_VOL5_USD = float(os.getenv("SPEC_NOTIFY_VOL5_USD", "300"))
+SPEC_NOTIFY_MAX_SPREAD_PCT = float(os.getenv("SPEC_NOTIFY_MAX_SPREAD_PCT", "2.0"))
+SPEC_BOOK_NOTIONAL_USD = float(os.getenv("SPEC_BOOK_NOTIONAL_USD", "200"))
+SPEC_BOOK_PRICE_BAND_PCT = float(os.getenv("SPEC_BOOK_PRICE_BAND_PCT", "2.0"))
+SPEC_BOOK_MAX_CROSS_PCT = float(os.getenv("SPEC_BOOK_MAX_CROSS_PCT", "2.5"))
+SPEC_BOOK_CHECKS_PER_SCAN = int(os.getenv("SPEC_BOOK_CHECKS_PER_SCAN", "6"))
+CDC_BOOK_URL = "https://api.crypto.com/exchange/v1/public/get-book"
 SPEC_PAIR_COOLDOWN_MIN = int(os.getenv("SPEC_PAIR_COOLDOWN_MIN", "480"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
@@ -1678,6 +1687,115 @@ def speculative_confirm(pair, item, candle, now):
     if closed_ts <= prior_candle or now-first_seen<30:
         return False
     return True
+
+
+def speculative_notification_precheck(item,candle):
+    """V9B: detect ALL microcaps; notify only selective, recent candidates."""
+    if not speculative_evidence(item,candle):
+        return "no_current_impulse"
+    if fnum(candle.get("r5")) < SPEC_NOTIFY_RET5_PCT:
+        return "r5_under_3pct"
+    if fnum(candle.get("r15")) < 0.5:
+        return "r15_negative"
+    if fnum(candle.get("volume_5m_usd_est")) < SPEC_NOTIFY_VOL5_USD:
+        return "trading_5m_under_300_usd"
+    ask=fnum(item.get("lowest_ask"))
+    bid=fnum(item.get("highest_bid"))
+    if ask<=0 or bid<=0 or ask<=bid:
+        return "invalid_bid_ask"
+    spread=(ask-bid)/((ask+bid)/2)*100
+    if spread > SPEC_NOTIFY_MAX_SPREAD_PCT:
+        return "spread_above_2pct"
+    return None
+
+
+def speculative_book_quality(snapshot, notional=None):
+    """Simulate $200 market depth on BOTH sides, no fake executable liquidity."""
+    notional = SPEC_BOOK_NOTIONAL_USD if notional is None else float(notional)
+    if not isinstance(snapshot,dict) or notional<=0:
+        return None
+    def levels(side, reverse):
+        raw=snapshot.get(side)
+        if not isinstance(raw,list):
+            return []
+        parsed=[]
+        for level in raw:
+            if not isinstance(level,(list,tuple)) or len(level)<2:
+                continue
+            px=fnum(level[0])
+            qty=fnum(level[1])
+            if px>0 and qty>0:
+                parsed.append((px,qty))
+        return sorted(parsed,key=lambda z:z[0],reverse=reverse)
+    bids=levels("bids",True)
+    asks=levels("asks",False)
+    if not bids or not asks:
+        return None
+    best_bid,best_ask=bids[0][0],asks[0][0]
+    if best_bid>=best_ask:
+        return None
+    spread=100*(best_ask-best_bid)/((best_ask+best_bid)/2)
+    if spread>SPEC_NOTIFY_MAX_SPREAD_PCT:
+        return None
+    target_qty=notional/best_ask
+    def execute(book,is_buy):
+        remaining=target_qty
+        value=0.0
+        filled=0.0
+        for price,qty in book:
+            if is_buy and price>best_ask*(1+SPEC_BOOK_PRICE_BAND_PCT/100):
+                break
+            if not is_buy and price<best_bid*(1-SPEC_BOOK_PRICE_BAND_PCT/100):
+                break
+            current=min(remaining,qty)
+            value+=current*price
+            filled+=current
+            remaining-=current
+            if remaining<=1e-10*target_qty:
+                break
+        if remaining>1e-8*target_qty or filled<=0:
+            return None
+        return value/filled
+    buy_avg=execute(asks,True)
+    sell_avg=execute(bids,False)
+    if not buy_avg or not sell_avg:
+        return None
+    cross=100*(buy_avg/sell_avg-1)
+    if cross<0 or cross>SPEC_BOOK_MAX_CROSS_PCT:
+        return None
+    return {"best_bid":best_bid,"best_ask":best_ask,
+            "spread_pct":spread,"avg_buy":buy_avg,"avg_sell":sell_avg,
+            "cross_pct":cross,"size_usd":notional}
+
+
+def speculative_fetch_book(pair,live):
+    """Real official Crypto.com Spot orderbook; no synthetic substitute."""
+    instrument=live.get("exchange_symbol")
+    if not instrument or not cdc_tradeable(pair):
+        return None
+    try:
+        r=session.get(CDC_BOOK_URL,params={"instrument_name":instrument,"depth":"50"},timeout=8)
+        r.raise_for_status()
+        body=r.json()
+        if body.get("code")!=0:
+            return None
+        result=body.get("result",{})
+        if result.get("instrument_name")!=instrument:
+            return None
+        data=result.get("data",[])
+        if not isinstance(data,list) or not data:
+            return None
+        quality=speculative_book_quality(data[0])
+        if not quality:
+            return None
+        for book_px,quote_px in (("best_ask","lowest_ask"),("best_bid","highest_bid")):
+            ticker_px=fnum(live.get(quote_px))
+            if ticker_px<=0 or abs(quality[book_px]/ticker_px-1)>0.01:
+                return None
+        return quality
+    except Exception as exc:
+        print(f"V9B BOOK ERROR — {pair} | {type(exc).__name__}",flush=True)
+        return None
 
 
 def speculative_message(pair, item, candle):
