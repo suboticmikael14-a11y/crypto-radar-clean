@@ -21,6 +21,15 @@ CDC_CANDLES_URL = "https://api.crypto.com/exchange/v1/public/get-candlestick"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 MIN_24H_QUOTE_VOL = float(os.getenv("MIN_24H_QUOTE_VOL", "150000"))
 MIN_WATCH_24H_QUOTE_VOL = float(os.getenv("MIN_WATCH_24H_QUOTE_VOL", "10000"))
+# Independent HIGH-RISK discovery: never loosen the V8 TRADE execution gate.
+SPEC_ENABLED = os.getenv("SPEC_ENABLED", "1").lower() in {"1","true","yes","on"}
+SPEC_MIN_RET5_PCT = float(os.getenv("SPEC_MIN_RET5_PCT", "1.20"))
+SPEC_FAST_RET1_PCT = float(os.getenv("SPEC_FAST_RET1_PCT", "0.75"))
+SPEC_MIN_RECENT_VOLUME_USD = float(os.getenv("SPEC_MIN_RECENT_VOLUME_USD", "0.01"))
+SPEC_MAX_SPREAD_PCT = float(os.getenv("SPEC_MAX_SPREAD_PCT", "25.0"))
+SPEC_ALERTS_PER_SCAN = int(os.getenv("SPEC_ALERTS_PER_SCAN", "2"))
+SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "30"))
+SPEC_PAIR_COOLDOWN_MIN = int(os.getenv("SPEC_PAIR_COOLDOWN_MIN", "480"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
 EARLY_MAX_RET5 = float(os.getenv("EARLY_MAX_RET5", "3.0"))
@@ -102,6 +111,8 @@ session.headers.update({"Accept": "application/json", "User-Agent": "crypto-rada
 
 history = defaultdict(lambda: deque(maxlen=HISTORY_MAX_MIN + 10))
 last_alert_at = {}
+last_spec_alert_at = {}
+spec_candidates = {}
 pilots = {}
 slack_blocked_until = 0.0
 last_slack_send_at = 0.0
@@ -144,6 +155,12 @@ def init_state_db():
         pair TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)""")
     _state_db.execute("""CREATE TABLE IF NOT EXISTS sent_trades (
         pair TEXT PRIMARY KEY, sent_at REAL NOT NULL)""")
+    _state_db.execute("""CREATE TABLE IF NOT EXISTS sent_spec_alerts (
+        pair TEXT PRIMARY KEY, sent_at REAL NOT NULL)""")
+    for pair, sent_at in _state_db.execute(
+        "SELECT pair,sent_at FROM sent_spec_alerts WHERE sent_at >= ?", (time.time()-7*86400,)
+    ).fetchall():
+        last_spec_alert_at[pair] = float(sent_at)
     for pair, sent_at in _state_db.execute(
         "SELECT pair,sent_at FROM sent_trades WHERE sent_at >= ?", (time.time()-7*86400,)
     ).fetchall():
@@ -195,6 +212,16 @@ def mark_trade_sent(pair, timestamp):
         _state_db.execute("DELETE FROM pilot_state WHERE pair=?", (pair,))
         _state_db.execute("""INSERT INTO sent_trades(pair,sent_at) VALUES (?,?)
             ON CONFLICT(pair) DO UPDATE SET sent_at=excluded.sent_at""", (pair, timestamp))
+        _state_db.commit()
+
+
+def mark_spec_sent(pair, timestamp):
+    """Independent persistent cooldown; NEVER delete pilots or block a later TRADE."""
+    last_spec_alert_at[pair] = timestamp
+    spec_candidates.pop(pair, None)
+    if _state_db is not None:
+        _state_db.execute("""INSERT INTO sent_spec_alerts(pair,sent_at) VALUES (?,?)
+            ON CONFLICT(pair) DO UPDATE SET sent_at=excluded.sent_at""", (pair,timestamp))
         _state_db.commit()
 
 
@@ -582,7 +609,9 @@ def cdc_candle_metrics(pair, now=None):
     if not item:
         return None
     instrument = item.get("exchange_symbol")
-    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument:
+    # Speculative watchlists refresh EVERY scan for a second distinct closed
+    # candle. Other markets retain the 75s cache to protect the exchange API.
+    if cached and now - cached[0] < 75 and cached[1].get("symbol") == instrument and pair not in spec_candidates:
         return cached[1]
     try:
         r = session.get(CDC_CANDLES_URL, params={
@@ -623,6 +652,8 @@ def cdc_candle_metrics(pair, now=None):
         ratio = min(80.0, max(0.0, ratio))
         metrics = {
             "volume_ratio": ratio, "r1": pct(closes[-1], closes[-2]),
+            "volume_5m_usd_est": sum(values[-5:]),
+            "closed_at": fnum(closed[-1]["t"])/1000.0,
             "atr_1m_pct": median_true_range_pct,
             "r5": pct(closes[-1], closes[-6]),
             "r15": pct(closes[-1], closes[-16]), "close": closes[-1],
@@ -1600,6 +1631,110 @@ def send_slack_once(message: str) -> bool:
         return False
 
 
+def speculative_evidence(item, candle):
+    """Independent price-impulse detector, including sub-$10k CDC Spot markets.
+
+    Deliberately ignores the V8 pilot/AI/trade liquidity limits, but requires
+    REAL fresh Exchange candles and a recent traded amount (even tiny).
+    A 24h top-gainer percentage alone is NOT a current buy opportunity.
+    """
+    if not SPEC_ENABLED or not item or not candle:
+        return False
+    if fnum(candle.get("age_sec"),9999)>CANDLE_MIN_FRESH_SEC:
+        return False
+    if fnum(candle.get("closed_at"))<=0 or fnum(candle.get("volume_5m_usd_est"))<SPEC_MIN_RECENT_VOLUME_USD:
+        return False
+    price=fnum(item.get("last"))
+    bid=fnum(item.get("highest_bid"))
+    ask=fnum(item.get("lowest_ask"))
+    qv=fnum(item.get("quote_volume"))
+    if not (price>0 and bid>0 and ask>=bid>0 and 0<qv<MIN_24H_QUOTE_VOL):
+        return False
+    spread=(ask-bid)/((ask+bid)/2)*100
+    if spread>SPEC_MAX_SPREAD_PCT:
+        return False
+    r1=fnum(candle.get("r1"))
+    r5=fnum(candle.get("r5"))
+    r15=fnum(candle.get("r15"))
+    return bool((r5>=SPEC_MIN_RET5_PCT and r15>=0.5)
+                or (r1>=SPEC_FAST_RET1_PCT and r5>=0.65 and r15>=0.25))
+
+
+def speculative_confirm(pair, item, candle, now):
+    """Two DISTINCT closed 1m candles must sustain the impulse before Slack."""
+    if not speculative_evidence(item,candle):
+        spec_candidates.pop(pair,None)
+        return False
+    if last_spec_alert_at.get(pair,0)+SPEC_PAIR_COOLDOWN_MIN*60>now:
+        return False
+    if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
+        return False
+    closed_ts=fnum(candle.get("closed_at"))
+    previous=spec_candidates.get(pair)
+    if previous is None or closed_ts<=0 or now-previous[0]>15*60:
+        spec_candidates[pair]=(now,closed_ts)
+        return False
+    first_seen, prior_candle=previous
+    if closed_ts <= prior_candle or now-first_seen<30:
+        return False
+    return True
+
+
+def speculative_message(pair, item, candle):
+    """High-risk RADAR, NEVER a V8 TRADE-approved instruction."""
+    price=fnum(item.get("last"))
+    bid=fnum(item.get("highest_bid"))
+    ask=fnum(item.get("lowest_ask"))
+    spread=100*(ask-bid)/((ask+bid)/2)
+    qv=fnum(item.get("quote_volume"))
+    mv=fnum(candle.get("volume_5m_usd_est"))
+    sym=item.get("exchange_symbol","")
+    risk=("EXTRÊME — carnet très large, vente potentiellement difficile"
+          if spread>=3 or mv<100 else "TRÈS ÉLEVÉ — liquidité limitée")
+    return (
+        f"🚀 PEPITO — MICROCAP SPÉCULATIVE | RISQUE TRÈS ÉLEVÉ\n"
+        f"{pair} | Crypto.com Exchange Spot : {sym}\n"
+        f"Prix indicatif : {price:.10g} USD | meilleure vente : {ask:.10g} USD\n"
+        f"Variation 1m : {fnum(candle.get('r1')):+.2f}% | 5m : {fnum(candle.get('r5')):+.2f}% "
+        f"| 15m : {fnum(candle.get('r15')):+.2f}% | 24h : {fnum(item.get('change_percentage')):+.2f}%\n"
+        f"Volume 24h Exchange : {qv:,.0f} USD | échanges 5m : {mv:,.2f} USD\n"
+        f"Spread observé : {spread:.2f}% | RISQUE : {risk}\n"
+        f"⚠️ SIGNAL DE DÉTECTION, PAS TRADE VALIDÉ. AUCUN GAIN OU PRIX EXÉCUTABLE GARANTI.\n"
+        f"⚠️ Si tu envisages une entrée, vérifie le carnet et utilise uniquement un ordre LIMIT. "
+        f"Le spread et le manque d'acheteurs peuvent empêcher toute sortie.\n"
+        f"Pas de signal de stop/TP fiable sur ce carnet. AUCUN ORDRE AUTOMATIQUE."
+    )
+
+
+def speculative_live_requote(pair, item):
+    """Live official Spot ask/bid immediately before a speculative notification."""
+    instrument=item.get("exchange_symbol")
+    if not instrument or not cdc_tradeable(pair):
+        return None
+    try:
+        r=session.get(CDC_TICKERS_URL,params={"instrument_name":instrument},timeout=8)
+        r.raise_for_status()
+        quotes=normalize_cdc_tickers(r.json(),{instrument},time.time())
+        if not quotes:
+            return None
+        live=quotes[0]
+        bid=fnum(live.get("highest_bid"))
+        ask=fnum(live.get("lowest_ask"))
+        old=fnum(item.get("last"))
+        new=fnum(live.get("last"))
+        if not (old>0 and new>0 and bid>0 and ask>=bid):
+            return None
+        # Fast reversal or extreme chase after scanner sample = no new signal.
+        if new/old<0.96 or new/old>1.08:
+            return None
+        if (ask-bid)/((ask+bid)/2)*100>SPEC_MAX_SPREAD_PCT:
+            return None
+        return live
+    except Exception as exc:
+        print(f"V9 REQUOTE ERROR — {pair} {type(exc).__name__}",flush=True)
+        return None
+
+
 def run():
     print(
         f"Crypto Radar Clean démarre | interval={SCAN_INTERVAL}s | "
@@ -1607,10 +1742,10 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V8 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
+        f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
-        f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
+        f"Slack={'TRADE_PLUS_SPEC' if SPEC_ENABLED else 'TRADE_ONLY'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
         flush=True,
     )
     if AI_ENABLED and not OPENAI_API_KEY:
@@ -1660,6 +1795,23 @@ def run():
             # Evaluate a full market rotation plus active pilots and fresh movers.
             chosen = v5_choose_candle_pairs(tickers)
             fresh_candles = v5_load_candles(chosen, now)
+            # Independent discovery pass: does NOT depend on regular pilot score,
+            # MIN_WATCH_24H_QUOTE_VOL, V8 AI or execution volume thresholds.
+            speculative_ready = []
+            speculative_seen = 0
+            for pair, candle in fresh_candles.items():
+                item = by_pair.get(pair)
+                if pair in positions or not item:
+                    continue
+                if speculative_evidence(item,candle):
+                    speculative_seen += 1
+                if speculative_confirm(pair,item,candle,now):
+                    speculative_ready.append((pair,item,candle))
+            speculative_ready.sort(
+                key=lambda x:(min(15.0,fnum(x[2].get("r5")))
+                              +max(0.0,min(5.0,fnum(x[2].get("r1")))),
+                              fnum(x[1].get("quote_volume"))),reverse=True)
+
             raw_signals = []
             tracked_signals = []
             for pair, candle in fresh_candles.items():
@@ -1785,6 +1937,39 @@ def run():
                     flush=True,
                 )
 
+            speculative_sent = 0
+            speculative_quoted = 0
+            if speculative_ready and SPEC_ENABLED:
+                hour_count=sum(1 for ts in last_spec_alert_at.values() if ts>=now-3600)
+                slots=max(0,min(SPEC_ALERTS_PER_SCAN,SPEC_ALERTS_PER_HOUR-hour_count))
+                for pair,item,candle in speculative_ready[:slots]:
+                    # Existing classical TRADE may have been sent this scan.
+                    if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
+                        continue
+                    # Recompute candle age AFTER a potentially long AI review.
+                    live_candle=dict(candle)
+                    live_candle["age_sec"]=time.time()-fnum(candle.get("closed_at"))-60
+                    if live_candle["age_sec"]>CANDLE_MIN_FRESH_SEC:
+                        continue
+                    live=speculative_live_requote(pair,item)
+                    if not live or not speculative_evidence(live,live_candle):
+                        continue
+                    speculative_quoted+=1
+                    msg=speculative_message(pair,live,candle)
+                    if SLACK_ENABLED and SLACK_WEBHOOK_URL:
+                        if send_slack_once(msg):
+                            mark_spec_sent(pair,time.time())
+                            speculative_sent+=1
+                            print(f"V9 MICROCAP SLACK — {pair} | qv24={live['quote_volume']:.0f} "
+                                  f"r5={candle['r5']:+.2f}% | spread high risk",flush=True)
+                    else:
+                        print(f"V9 MICROCAP TEST — {pair} | no Slack",flush=True)
+                if len(speculative_ready)>slots:
+                    print(f"V9 MICROCAP BACKLOG — {len(speculative_ready)-slots} attente "
+                          f"(plafond horaire/scan, aucune suppression)",flush=True)
+            print(f"V9 SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
+                  f"IMPULSES {speculative_seen} -> 2X CONFIRMED {len(speculative_ready)} "
+                  f"-> LIVE REQUOTE {speculative_quoted} -> SLACK {speculative_sent}",flush=True)
             if gate_rejections:
                 print("PEPITO REJETS — " + " | ".join(
                     f"{name}={count}" for name, count in gate_rejections.most_common()
@@ -1904,6 +2089,44 @@ def pepito_selftest():
         slack_message=format_trade_alert(not_durable,sturdy)
         assert "15 min MAXIMUM" in slack_message and "5.01" in slack_message
         assert "AUCUN ORDRE AUTOMATIQUE" in slack_message
+
+        # V9: liquidity gates must never hide a real rising MICROCAP, but
+        # an old +50% daily move without recent REAL trades must not notify.
+        for sym,qv,bid,ask in (
+            ("LUMIA",9089,0.115502,0.118722),
+            ("ERA",1803,0.082851,0.085374),
+            ("A2Z",1420,0.000034622,0.000035956),
+            ("TEVA",1995,0.0016718,0.0019008),
+            ("CAP",33207,0.093,0.093485),
+            ("MAGIC",162801,0.10679,0.10698),
+            ("OP",108981,0.135733,0.135757),
+        ):
+            pair=sym+"_USDT"
+            item={"currency_pair":pair,"exchange_symbol":sym+"_USD",
+                  "last":ask,"highest_bid":bid,"lowest_ask":ask,
+                  "quote_volume":qv,"change_percentage":30.0}
+            impulse={"age_sec":20,"closed_at":now-60,
+                     "volume_5m_usd_est":15.0,"volume_ratio":3.0,
+                     "r1":0.9,"r5":2.4,"r15":3.0}
+            assert speculative_evidence(item,impulse),(sym,"no detection")
+            assert not speculative_confirm(pair,item,impulse,now)
+            assert not speculative_confirm(pair,item,impulse,now+45)
+            next_min=dict(impulse,closed_at=now,age_sec=10)
+            assert speculative_confirm(pair,item,next_min,now+65),(sym,"multipass")
+            msg=speculative_message(pair,item,next_min)
+            assert "MICROCAP SPÉCULATIVE" in msg and "PAS TRADE VALIDÉ" in msg
+            assert "AUCUN ORDRE AUTOMATIQUE" in msg
+            # Never alert only because a 24h statistic rose hours ago.
+            assert not speculative_evidence(item,dict(impulse,r1=0,r5=0,r15=0))
+            assert not speculative_evidence(item,dict(impulse,volume_5m_usd_est=0))
+            last_spec_alert_at[pair]=now+65
+            assert not speculative_confirm(pair,item,next_min,now+75)
+            spec_candidates.pop(pair,None)
+            last_spec_alert_at.pop(pair,None)
+        assert not speculative_evidence(
+            {"last":1,"highest_bid":0.99,"lowest_ask":1.01,
+             "quote_volume":600000},dict(impulse))
+        assert MIN_24H_QUOTE_VOL>=500000
 
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
@@ -2093,7 +2316,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
