@@ -1547,6 +1547,7 @@ def format_trade_alert(c: ConfirmedCandidate, review: AIReview) -> str:
         f"spread {s.spread_pct:.3f}%\n"
         f"✅ Fenêtre de décision : {SIGNAL_ENTRY_WINDOW_MIN} min MAXIMUM après réception, pas un achat garanti.\n"
         f"⚠️ ACHAT LIMIT uniquement : vérifier que l'ask Crypto.com est dans la bande de contrôle.\n"
+        f"⚠️ Annuler tout ordre LIMIT non exécuté avant la fin des {SIGNAL_ENTRY_WINDOW_MIN} minutes ; ne pas laisser GTC en attente.\n"
         f"⚠️ Au-dessus du plafond, sous le plancher, sous le stop ou après la fenêtre : PAS D'ACHAT.\n"
         f"⚠️ Si le mouvement s'inverse franchement ou la liquidité disparaît : PAS D'ACHAT.\n"
         f"Frais et glissement estimés, profits non garantis. AUCUN ORDRE AUTOMATIQUE.\n"
@@ -1606,7 +1607,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V7 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
+        f"VALIDATION V8 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
