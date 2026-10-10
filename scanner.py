@@ -1743,7 +1743,7 @@ def run():
         f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
-        f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
+        f"Slack={\'TRADE_PLUS_SPEC\' if SPEC_ENABLED else \'TRADE_ONLY\'} | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
         flush=True,
     )
     if AI_ENABLED and not OPENAI_API_KEY:
@@ -1944,8 +1944,13 @@ def run():
                     # Existing classical TRADE may have been sent this scan.
                     if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
                         continue
+                    # Recompute candle age AFTER a potentially long AI review.
+                    live_candle=dict(candle)
+                    live_candle["age_sec"]=time.time()-fnum(candle.get("closed_at"))-60
+                    if live_candle["age_sec"]>CANDLE_MIN_FRESH_SEC:
+                        continue
                     live=speculative_live_requote(pair,item)
-                    if not live or not speculative_evidence(live,candle):
+                    if not live or not speculative_evidence(live,live_candle):
                         continue
                     speculative_quoted+=1
                     msg=speculative_message(pair,live,candle)
