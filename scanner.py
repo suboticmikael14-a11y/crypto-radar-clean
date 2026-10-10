@@ -2083,6 +2083,44 @@ def pepito_selftest():
         assert "15 min MAXIMUM" in slack_message and "5.01" in slack_message
         assert "AUCUN ORDRE AUTOMATIQUE" in slack_message
 
+        # V9: liquidity gates must never hide a real rising MICROCAP, but
+        # an old +50% daily move without recent REAL trades must not notify.
+        for sym,qv,bid,ask in (
+            ("LUMIA",9089,0.115502,0.118722),
+            ("ERA",1803,0.082851,0.085374),
+            ("A2Z",1420,0.000034622,0.000035956),
+            ("TEVA",1995,0.0016718,0.0019008),
+            ("CAP",33207,0.093,0.093485),
+            ("MAGIC",162801,0.10679,0.10698),
+            ("OP",108981,0.135733,0.135757),
+        ):
+            pair=sym+"_USDT"
+            item={"currency_pair":pair,"exchange_symbol":sym+"_USD",
+                  "last":ask,"highest_bid":bid,"lowest_ask":ask,
+                  "quote_volume":qv,"change_percentage":30.0}
+            impulse={"age_sec":20,"closed_at":now-60,
+                     "volume_5m_usd_est":15.0,"volume_ratio":3.0,
+                     "r1":0.9,"r5":2.4,"r15":3.0}
+            assert speculative_evidence(item,impulse),(sym,"no detection")
+            assert not speculative_confirm(pair,item,impulse,now)
+            assert not speculative_confirm(pair,item,impulse,now+45)
+            next_min=dict(impulse,closed_at=now,age_sec=10)
+            assert speculative_confirm(pair,item,next_min,now+65),(sym,"multipass")
+            msg=speculative_message(pair,item,next_min)
+            assert "MICROCAP SPÉCULATIVE" in msg and "PAS TRADE VALIDÉ" in msg
+            assert "AUCUN ORDRE AUTOMATIQUE" in msg
+            # Never alert only because a 24h statistic rose hours ago.
+            assert not speculative_evidence(item,dict(impulse,r1=0,r5=0,r15=0))
+            assert not speculative_evidence(item,dict(impulse,volume_5m_usd_est=0))
+            last_spec_alert_at[pair]=now+65
+            assert not speculative_confirm(pair,item,next_min,now+75)
+            spec_candidates.pop(pair,None)
+            last_spec_alert_at.pop(pair,None)
+        assert not speculative_evidence(
+            {"last":1,"highest_bid":0.99,"lowest_ask":1.01,
+             "quote_volume":600000},dict(impulse))
+        assert MIN_24H_QUOTE_VOL>=500000
+
         # V7b: the DOGE alert which escaped V7 on deployment did NOT show
         # confirmed 5m/15m momentum. Do not allow AI targets alone to qualify.
         cdc_pairs.add("DOGE_USD")
@@ -2271,7 +2309,7 @@ def pepito_selftest():
         assert position_action("SELF_USDT",1.11) == "PRENDRE DES BENEFICES"
         assert position_action("SELF_USDT",1.21) == "VENDRE DAVANTAGE"
 
-        print("PEPITO SELFTEST — PASS | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
+        print("PEPITO SELFTEST — PASS | V9_MICROCAP_LOW_VOLUME | V9_DISTINCT_CANDLES | V9_SPEC_COOLDOWN | V8_CONDITIONAL_15M_PRICE_BAND | V8_NEAR_HEADROOM | V8_STRONG_PASS | V7B_DOGE_WEAK_MOMENTUM_BLOCK | V7_STRONG_TRADE_ONLY | V7_OLD_ADA_QNT_BLOCK | V7_ATR_STOP | V7_COOLDOWN | V6_EARLY_MICROCAP_WATCH | V6_TRADE_LIQUIDITY_LOCK | V6_POST_PUMP_REACCEL | V5_CANDLE_FIRST | V5_ROTATING_SPOT | V5_NO_STABLE_QUOTES | CDC_PRIMARY_OGN_STRK_RLC | CONTINUATION_STRK | 7DAY_HISTORY | SWING_ACCUMULATION | CDC_BLOCK | NET_PROFIT_GATE | REAL_ALERT_REGRESSIONS | VALIDATE_TRADE | PROGRESSIVE_ACCEL | LOW_LIQUIDITY | ANTI_CHASE | SCORE_REACHABLE | GATE_DIAGNOSTICS | POSITION_EXITS", flush=True)
         return True
     finally:
         cdc_pairs = old_cdc
