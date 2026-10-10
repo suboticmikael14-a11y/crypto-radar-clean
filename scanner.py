@@ -28,7 +28,7 @@ SPEC_FAST_RET1_PCT = float(os.getenv("SPEC_FAST_RET1_PCT", "0.75"))
 SPEC_MIN_RECENT_VOLUME_USD = float(os.getenv("SPEC_MIN_RECENT_VOLUME_USD", "0.01"))
 SPEC_MAX_SPREAD_PCT = float(os.getenv("SPEC_MAX_SPREAD_PCT", "25.0"))
 SPEC_ALERTS_PER_SCAN = int(os.getenv("SPEC_ALERTS_PER_SCAN", "2"))
-SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "8"))
+SPEC_ALERTS_PER_HOUR = int(os.getenv("SPEC_ALERTS_PER_HOUR", "30"))
 SPEC_PAIR_COOLDOWN_MIN = int(os.getenv("SPEC_PAIR_COOLDOWN_MIN", "480"))
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "3"))
 EARLY_MIN_VOLUME_RATIO = float(os.getenv("EARLY_MIN_VOLUME_RATIO", "3"))
@@ -1740,7 +1740,7 @@ def run():
         flush=True,
     )
     print(
-        f"VALIDATION V8 ACTIVE — CDC SPOT->ANOMALIE->SUIVI->CONTINUATION->IA->FORTE_OPPORTUNITE | "
+        f"VALIDATION V9 ACTIVE — CDC SPOT->ALERTES MICROCAP RISQUÉES + TRADE V8 STRICT | "
         f"pilot={PILOT_SCORE} | confirm={CONFIRMED_SCORE} | ttl={PILOT_TTL_MIN}m | "
         f"AI={'ON' if AI_ENABLED and OPENAI_API_KEY else 'OFF'} | model={OPENAI_MODEL} | "
         f"Slack=TRADE_ONLY | ai_age<={AI_MAX_SIGNAL_AGE_MIN}m | gain<={AI_MAX_PRICE_GAIN:.1f}%",
@@ -1793,6 +1793,23 @@ def run():
             # Evaluate a full market rotation plus active pilots and fresh movers.
             chosen = v5_choose_candle_pairs(tickers)
             fresh_candles = v5_load_candles(chosen, now)
+            # Independent discovery pass: does NOT depend on regular pilot score,
+            # MIN_WATCH_24H_QUOTE_VOL, V8 AI or execution volume thresholds.
+            speculative_ready = []
+            speculative_seen = 0
+            for pair, candle in fresh_candles.items():
+                item = by_pair.get(pair)
+                if pair in positions or not item:
+                    continue
+                if speculative_evidence(item,candle):
+                    speculative_seen += 1
+                if speculative_confirm(pair,item,candle,now):
+                    speculative_ready.append((pair,item,candle))
+            speculative_ready.sort(
+                key=lambda x:(min(15.0,fnum(x[2].get("r5")))
+                              +max(0.0,min(5.0,fnum(x[2].get("r1")))),
+                              fnum(x[1].get("quote_volume"))),reverse=True)
+
             raw_signals = []
             tracked_signals = []
             for pair, candle in fresh_candles.items():
@@ -1918,6 +1935,34 @@ def run():
                     flush=True,
                 )
 
+            speculative_sent = 0
+            speculative_quoted = 0
+            if speculative_ready and SPEC_ENABLED:
+                hour_count=sum(1 for ts in last_spec_alert_at.values() if ts>=now-3600)
+                slots=max(0,min(SPEC_ALERTS_PER_SCAN,SPEC_ALERTS_PER_HOUR-hour_count))
+                for pair,item,candle in speculative_ready[:slots]:
+                    # Existing classical TRADE may have been sent this scan.
+                    if last_alert_at.get(pair,0)+PAIR_COOLDOWN_MIN*60>now:
+                        continue
+                    live=speculative_live_requote(pair,item)
+                    if not live or not speculative_evidence(live,candle):
+                        continue
+                    speculative_quoted+=1
+                    msg=speculative_message(pair,live,candle)
+                    if SLACK_ENABLED and SLACK_WEBHOOK_URL:
+                        if send_slack_once(msg):
+                            mark_spec_sent(pair,time.time())
+                            speculative_sent+=1
+                            print(f"V9 MICROCAP SLACK — {pair} | qv24={live['quote_volume']:.0f} "
+                                  f"r5={candle['r5']:+.2f}% | spread high risk",flush=True)
+                    else:
+                        print(f"V9 MICROCAP TEST — {pair} | no Slack",flush=True)
+                if len(speculative_ready)>slots:
+                    print(f"V9 MICROCAP BACKLOG — {len(speculative_ready)-slots} attente "
+                          f"(plafond horaire/scan, aucune suppression)",flush=True)
+            print(f"V9 SPEC JOURNAL — CANDLES {len(fresh_candles)} -> "
+                  f"IMPULSES {speculative_seen} -> 2X CONFIRMED {len(speculative_ready)} "
+                  f"-> LIVE REQUOTE {speculative_quoted} -> SLACK {speculative_sent}",flush=True)
             if gate_rejections:
                 print("PEPITO REJETS — " + " | ".join(
                     f"{name}={count}" for name, count in gate_rejections.most_common()
