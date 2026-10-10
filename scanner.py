@@ -2131,8 +2131,52 @@ def pepito_integration_test():
           +" | Assets="+str(len(all_tickers))+" | "+" | ".join(checked), flush=True)
 
 
+def pepito_coverage_audit():
+    """One-shot read-only coverage triage, NEVER Slack/AI or any trading."""
+    targets=["LUMIA","MAGIC","ERA","A2Z","CAP","TEVA","PIXEL","OP"]
+    refresh_cdc_pairs()
+    r=session.get(CDC_TICKERS_URL,timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    raw=r.json().get("result",{}).get("data",[])
+    decoded=normalize_cdc_tickers({"code":0,"result":{"data":raw}},cdc_pairs)
+    bypair={x["currency_pair"]:x for x in decoded}
+    cdc_ticker_by_pair.clear()
+    cdc_ticker_by_pair.update(bypair)
+    print(f"V9 COUVERTURE — whitelist={len(cdc_pairs)} raw_quotes={len(raw)} "
+          f"normalized={len(decoded)}",flush=True)
+    for symbol in targets:
+        listed=sorted(x for x in cdc_pairs if x in (symbol+"_USD",symbol+"_USDT"))
+        tick=[{"pair":x.get("i"),"price":x.get("a"),"bid":x.get("b"),
+               "ask":x.get("k"),"v24_usd":x.get("vv"),"change_24h":x.get("c"),
+               "age_sec":int(time.time()-fnum(x.get("t"))/1000.0)}
+              for x in raw if str(x.get("i","")).upper() in listed]
+        live=bypair.get(symbol+"_USDT")
+        candle=cdc_candle_metrics(symbol+"_USDT") if live else None
+        ready=bool(live and candle and candle["age_sec"]<=CANDLE_MIN_FRESH_SEC)
+        reasons=[]
+        if not listed:reasons.append("NOT_ON_EXCHANGE_SPOT")
+        if not live:reasons.append("RAW_TICKER_REJECTED_OR_MISSING")
+        if live and fnum(live["quote_volume"])<MIN_WATCH_24H_QUOTE_VOL:
+            reasons.append("WATCH_VOL_TOO_LOW")
+        if live and fnum(live["quote_volume"])<MIN_24H_QUOTE_VOL:
+            reasons.append("TRADE_VOL_TOO_LOW")
+        if live and (fnum(live["lowest_ask"])-fnum(live["highest_bid"]))/fnum(live["last"])*100>0.5:
+            reasons.append("SPREAD_TOO_WIDE")
+        if live and not candle:reasons.append("CANDLES_NOT_FRESH_OR_MISSING")
+        if candle and candle["volume_1m_usd_est"]<150:reasons.append("1M_VOL_TOO_LOW")
+        print("V9 AUDIT — "+symbol+" | "+json.dumps({
+           "spot":listed,"raw":tick,"normalized":live,
+           "candles":{k:round(fnum(candle[k]),5) for k in
+                      ("r1","r5","r15","volume_ratio","volume_1m_usd_est","age_sec")}
+                        if candle else None,"eligible_candle":ready,
+           "rejects":reasons},ensure_ascii=False),flush=True)
+    print("PEPITO V9 COVERAGE AUDIT — COMPLETE, NO ALERTS",flush=True)
+
+
 if __name__ == "__main__":
-    if os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
+    if os.getenv("PEPITO_COVERAGE_AUDIT", "0").lower() in {"1","true","yes","on"}:
+        pepito_coverage_audit()
+    elif os.getenv("PEPITO_INTEGRATION_TEST", "0").lower() in {"1","true","yes","on"}:
         pepito_integration_test()
     elif os.getenv("PEPITO_SELFTEST", "0").strip().lower() in {"1","true","yes","on"}:
         pepito_selftest()
