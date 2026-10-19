@@ -1,0 +1,1 @@
+V10 isolated test plan: dynamic signal count, missed-pump analysis, separate scoring, momentum phase detection, 24-hour monitoring, and exit simulations. No changes to V9B or Slack.
