@@ -3,7 +3,7 @@
 
 Runs on the SEPARATE Railway test service only. Never sends Slack, places orders,
 or changes V9B production. V9B-eligible signals are the comparison cohort; a
-pre-registered V10 rule flags up to three per KST day, prospectively. Stores both
+pre-registered V10 rule flags unlimited qualified candidates per KST day, prospectively. Stores both
 chosen AND unchosen signals in the test service's persistent SQLite volume.
 
 Evaluation labels (fixed BEFORE live observation):
@@ -37,9 +37,9 @@ v9.OPENAI_API_KEY = ""
 v9.STATE_DB_PATH = os.getenv("V10_SCANNER_DB", "/data/v10_scanner.sqlite3")
 v9.POSITIONS_FILE = "/data/v10_no_positions.json"
 DB_PATH = os.getenv("V10_SHADOW_DB", "/data/v10_shadow.sqlite3")
-RULE_VERSION = "V10_SHADOW_PRECOMMITTED_20261012"
+RULE_VERSION = "V10_IMPROVED_20261019"
 SELECT_THRESHOLD = 68
-MAX_DAILY_SELECTIONS = 3
+MAX_DAILY_SELECTIONS = 1000000
 HORIZONS_MIN = (60, 240, 1440)
 COST_PROXY_PCT = 1.30
 KST = timezone(timedelta(hours=9))
@@ -73,7 +73,11 @@ def score_signal(item, candle, book):
         early = 20.0
     else:
         early = max(0.0, 20.0 - 0.45 * (r24 - 12))
-    return round(max(0.0, min(100.0, momentum + volume + execution + early)), 1)
+    # V10: dynamic market-phase score, no cap on daily signals.
+    phase_bonus = (6 if r1 > 0.1 and r5 > 0.5 and r15 > 0.7
+                   else 3 if abs(r5) < 1 and v5 > 600
+                   else -5 if r5 > 12 and r1 < 0 else 0)
+    return round(max(0.0, min(100.0, momentum + volume + execution + early + phase_bonus)), 1)
 
 
 def selftest():
@@ -86,7 +90,7 @@ def selftest():
     assert score_signal(good,gc,gb) > score_signal(bad,bc,bb)
     assert score_signal(good,gc,gb) >= SELECT_THRESHOLD
     assert all(0 <= score_signal(good,gc,{"cross_pct":x}) <= 100 for x in (0,1,2.5,500))
-    assert MAX_DAILY_SELECTIONS == 3 and COST_PROXY_PCT >= 1.0
+    assert MAX_DAILY_SELECTIONS > 1000 and COST_PROXY_PCT >= 1.0
     print("V10 SELFTEST PASS | ranking monotonic | fixed threshold | no Slack | no orders",flush=True)
 
 
@@ -107,6 +111,12 @@ def setup_db():
        samples INTEGER NOT NULL DEFAULT 0)""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_v10_time ON shadow_signals(created_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_v10_day ON shadow_signals(kst_day,chosen)")
+    db.execute("""CREATE TABLE IF NOT EXISTS v10_followup(
+       event_id INTEGER NOT NULL,observed_at REAL NOT NULL,bid REAL NOT NULL,
+       gross_pct REAL NOT NULL,phase TEXT NOT NULL,PRIMARY KEY(event_id,observed_at))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS v10_exit_simulations(
+       event_id INTEGER NOT NULL,strategy TEXT NOT NULL,net_proxy_pct REAL NOT NULL,
+       reason TEXT NOT NULL,PRIMARY KEY(event_id,strategy))""")
     db.execute("""CREATE TABLE IF NOT EXISTS shadow_outcomes(
        event_id INTEGER NOT NULL,horizon_min INTEGER NOT NULL,
        observed_at REAL NOT NULL, bid REAL NOT NULL,
@@ -128,7 +138,7 @@ def recorded_day_count(db,day):
 def record(db,item,candle,book,now):
     day=datetime.fromtimestamp(now,KST).strftime("%Y-%m-%d")
     score=score_signal(item,candle,book)
-    chosen=(score >= SELECT_THRESHOLD and recorded_day_count(db,day)<MAX_DAILY_SELECTIONS)
+    chosen=(score >= SELECT_THRESHOLD) # Unlimited daily candidates; quality threshold only
     pair=item["currency_pair"]
     ask=v9.fnum(item.get("lowest_ask"))
     bid=v9.fnum(item.get("highest_bid"))
@@ -170,6 +180,11 @@ def update_outcomes(db,tickers_by_pair,now):
         bid=v9.fnum(item.get("highest_bid"))
         if bid<=0:
             continue
+        gross=100.0*(bid/entry-1.0)
+        phase=("ACCELERATING" if gross>100*(high/entry-1) else
+               "REVERSING" if gross<100*(high/entry-1)-5 else "CONSOLIDATING")
+        db.execute("INSERT OR IGNORE INTO v10_followup(event_id,observed_at,bid,gross_pct,phase) VALUES(?,?,?,?,?)",
+                   (id_,now,bid,gross,phase))
         high=max(high,bid)
         low=min(low,bid)
         n+=1
@@ -189,6 +204,8 @@ def update_outcomes(db,tickers_by_pair,now):
                 bid,return_after_cost_pct,highest_bid,lowest_bid,samples)
                 VALUES(?,?,?,?,?,?,?,?)""",(id_,horizon,now,bid,net,high,low,n))
             completed+=1
+            if horizon==1440:
+                simulate_exits(db,id_,entry)
             print("V10 SHADOW OUTCOME "+json.dumps({
                 "id":id_,"pair":pair,"horizon_min":horizon,
                 "net_proxy_pct":round(net,2),
@@ -198,6 +215,43 @@ def update_outcomes(db,tickers_by_pair,now):
     db.commit()
     return sample_count,completed
 
+
+
+def simulate_exits(db,event_id,entry):
+    """Prospective rules evaluated on observed bid snapshots; not executable P&L."""
+    rows=db.execute("SELECT observed_at,bid FROM v10_followup WHERE event_id=? ORDER BY observed_at",(event_id,)).fetchall()
+    if not rows or entry<=0:return
+    start=rows[0][0]
+    for name,target,stop,trail,minutes in (
+        ("tp10_stop5",10,-5,False,1440),
+        ("tp20_stop8",20,-8,False,1440),
+        ("trailing5_stop8",None,-8,True,1440),
+        ("time4h",None,None,False,240),
+        ("time24h",None,None,False,1440)):
+        peak=-1000;out=None;reason="last_sample"
+        for ts,bid in rows:
+            gain=100*(bid/entry-1)
+            peak=max(peak,gain)
+            if stop is not None and gain<=stop:out=gain;reason="stop";break
+            if target is not None and gain>=target:out=gain;reason="target";break
+            if trail and peak>=5 and gain<=peak-5:out=gain;reason="trailing";break
+            if ts-start>=minutes*60:out=gain;reason="time";break
+        if out is None:out=100*(rows[-1][1]/entry-1)
+        db.execute("INSERT OR REPLACE INTO v10_exit_simulations VALUES(?,?,?,?)",
+                   (event_id,name,round(out-COST_PROXY_PCT,4),reason))
+
+def missed_pump_report(db):
+    """Same 24h cohort, including rejected signals, without hindsight in selection."""
+    rows=db.execute("""SELECT s.chosen,s.pair,s.score,
+         100*(o.highest_bid/s.buy_vwap-1) AS peak
+         FROM shadow_signals s JOIN shadow_outcomes o ON o.event_id=s.id
+         WHERE o.horizon_min=1440""").fetchall()
+    missed=sorted([(p,round(g,2),sc) for chosen,p,sc,g in rows if not chosen and g>=20],
+                  key=lambda x:-x[1])
+    hits=sum(1 for chosen,p,sc,g in rows if chosen and g>=20)
+    return {"missed20":missed[:20],"captured20":hits,
+            "total20":hits+len([1 for chosen,p,sc,g in rows if not chosen and g>=20]),
+            "calibration":"unavailable until sufficient independent labeled samples"}
 
 def report(db):
     total,selected=db.execute("SELECT COUNT(*),COALESCE(SUM(chosen),0) FROM shadow_signals").fetchone()
@@ -213,7 +267,7 @@ def report(db):
     latest=db.execute("SELECT MAX(created_at),MIN(created_at) FROM shadow_signals").fetchone()
     print("V10 SHADOW REPORT "+json.dumps({"rule":RULE_VERSION,"signals":total,
           "v10_selected":selected,"start":latest[1],"latest":latest[0],
-          "v10":group(1),"v9b_other":group(0)},separators=(",",":")),flush=True)
+          "v10":group(1),"v9b_other":group(0),"missed_pumps":missed_pump_report(db)},separators=(",",":")),flush=True)
 
 
 def run():
@@ -224,7 +278,7 @@ def run():
     v9.restore_pilot_history(time.time())
     print("V10 SHADOW ACTIVE | V9B algorithm reference | SLACK OFF | AI OFF "
           "| LIVE ORDERS NONE | own isolated persistent SQLite | "
-          f"rule={RULE_VERSION} | selected daily max={MAX_DAILY_SELECTIONS} "
+          f"rule={RULE_VERSION} | selected daily cap=NONE "
           f"| threshold={SELECT_THRESHOLD}",flush=True)
     counter=0
     while True:
