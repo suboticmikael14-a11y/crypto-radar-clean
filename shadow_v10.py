@@ -91,6 +91,17 @@ def selftest():
     assert score_signal(good,gc,gb) >= SELECT_THRESHOLD
     assert all(0 <= score_signal(good,gc,{"cross_pct":x}) <= 100 for x in (0,1,2.5,500))
     assert MAX_DAILY_SELECTIONS > 1000 and COST_PROXY_PCT >= 1.0
+    # Test that the time-based exit uses signal creation, not first observed quote.
+    mem=sqlite3.connect(":memory:")
+    mem.execute("CREATE TABLE shadow_signals(id INTEGER,created_at REAL)")
+    mem.execute("CREATE TABLE v10_followup(event_id INTEGER,observed_at REAL,bid REAL)")
+    mem.execute("CREATE TABLE v10_exit_simulations(event_id INTEGER,strategy TEXT,net_proxy_pct REAL,reason TEXT)")
+    mem.execute("INSERT INTO shadow_signals VALUES(1,1000)")
+    mem.executemany("INSERT INTO v10_followup VALUES(1,?,?)",
+                    [(1060,101),(1000+240*60,110),(1000+1440*60,120)])
+    simulate_exits(mem,1,100)
+    assert mem.execute("SELECT reason FROM v10_exit_simulations WHERE strategy='time4h'").fetchone()[0]=="time"
+    assert mem.execute("SELECT net_proxy_pct FROM v10_exit_simulations WHERE strategy='time4h'").fetchone()[0]>8
     print("V10 SELFTEST PASS | ranking monotonic | fixed threshold | no Slack | no orders",flush=True)
 
 
@@ -221,7 +232,7 @@ def simulate_exits(db,event_id,entry):
     """Prospective rules evaluated on observed bid snapshots; not executable P&L."""
     rows=db.execute("SELECT observed_at,bid FROM v10_followup WHERE event_id=? ORDER BY observed_at",(event_id,)).fetchall()
     if not rows or entry<=0:return
-    start=rows[0][0]
+    created=db.execute("SELECT created_at FROM shadow_signals WHERE id=?",(event_id,)).fetchone()[0]
     for name,target,stop,trail,minutes in (
         ("tp10_stop5",10,-5,False,1440),
         ("tp20_stop8",20,-8,False,1440),
@@ -235,7 +246,7 @@ def simulate_exits(db,event_id,entry):
             if stop is not None and gain<=stop:out=gain;reason="stop";break
             if target is not None and gain>=target:out=gain;reason="target";break
             if trail and peak>=5 and gain<=peak-5:out=gain;reason="trailing";break
-            if ts-start>=minutes*60:out=gain;reason="time";break
+            if ts>=created+minutes*60:out=gain;reason="time";break
         if out is None:out=100*(rows[-1][1]/entry-1)
         db.execute("INSERT OR REPLACE INTO v10_exit_simulations VALUES(?,?,?,?)",
                    (event_id,name,round(out-COST_PROXY_PCT,4),reason))
@@ -264,10 +275,16 @@ def report(db):
         hits20=sum(x[2]>=1.20 for x in vals)
         return {"matured":len(vals),"pumps10":hits10,"pumps20":hits20,
                 "avg_24h_net_proxy_pct":round(sum(x[1] for x in vals)/len(vals),2) if vals else None}
+    exits=db.execute("""SELECT strategy,COUNT(*),AVG(net_proxy_pct),
+        SUM(CASE WHEN net_proxy_pct>0 THEN 1 ELSE 0 END)
+        FROM v10_exit_simulations GROUP BY strategy""").fetchall()
+    exit_summary={name:{"samples":n,"avg_net_proxy_pct":round(avg,2),
+                         "profitable_pct":round(100*wins/n,1)}
+                  for name,n,avg,wins in exits if n}
     latest=db.execute("SELECT MAX(created_at),MIN(created_at) FROM shadow_signals").fetchone()
     print("V10 SHADOW REPORT "+json.dumps({"rule":RULE_VERSION,"signals":total,
           "v10_selected":selected,"start":latest[1],"latest":latest[0],
-          "v10":group(1),"v9b_other":group(0),"missed_pumps":missed_pump_report(db)},separators=(",",":")),flush=True)
+          "v10":group(1),"v9b_other":group(0),"missed_pumps":missed_pump_report(db),"exit_strategies":exit_summary},separators=(",",":")),flush=True)
 
 
 def run():
